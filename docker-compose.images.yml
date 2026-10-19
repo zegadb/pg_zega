@@ -1,0 +1,23 @@
+# Published images. Does not use the local compose project named pg-zega.
+name: pg-zega-images
+services:
+  zega:
+    image: ${DOCKERHUB_USERNAME}/zega:0.2.0
+    environment:
+      ZEGA_TOKEN: ${ZEGA_TOKEN:?Set ZEGA_TOKEN}
+    volumes:
+      - zega:/var/lib/zega
+    ports:
+      - "127.0.0.1:9342:9342"
+  postgres:
+    image: ${DOCKERHUB_USERNAME}/pg_zega:17
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      ZEGA_PASSWORD: ${ZEGA_TOKEN:?Set ZEGA_TOKEN}
+      ZEGA_URL: http://zega:9342
+    ports:
+      - "127.0.0.1:5433:5432"
+    depends_on:
+      - zega
+volumes:
+  zega:

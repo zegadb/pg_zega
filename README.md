@@ -38,6 +38,28 @@ ALTER ROLE postgres WITH PASSWORD '<postgres password>';
 
 Reload Postgres after changing `pg_hba.conf`.
 
+## Images
+
+The same pair is published as two Docker images. Neither image contains a password. Each refuses to start until you pass one.
+
+| Image | Tags | What it is |
+| --- | --- | --- |
+| `<account>/pg_zega` | `17`, `0.1` | Postgres 17 with pg_zega installed. Requires `POSTGRES_PASSWORD` and `ZEGA_PASSWORD`. |
+| `<account>/zega` | `0.2.0` | Zega 0.2.0 (`zegadb/zega@4ecaf43`). Listens on port 9342. Requires `ZEGA_TOKEN` or a file mounted at `/etc/zega/token`. |
+
+`ZEGA_PASSWORD` and `ZEGA_TOKEN` are the same secret. `POSTGRES_PASSWORD` is the other one. Trust authentication is refused.
+
+```sh
+export DOCKERHUB_USERNAME=<account>
+export POSTGRES_PASSWORD="$(openssl rand -base64 24)"
+export ZEGA_TOKEN="$(openssl rand -base64 32)"
+docker compose -f docker-compose.images.yml up
+```
+
+That file is a separate compose project named `pg-zega-images`. Postgres is on `127.0.0.1:5433` and Zega is on `127.0.0.1:9342`. Inside the network, Postgres calls Zega at `http://zega:9342`.
+
+GitHub Actions publishes both images when a release is published, and from the Actions tab with "publish". The job uses the `release` environment: secret `DOCKER_TOKEN`, variable `DOCKERHUB_USERNAME`. The workflow on the default branch is the one a release runs.
+
 ## Install
 
 Build it on the Postgres that will load it. The shared library has to match that server's major version and that machine's libcurl.
