@@ -1,4 +1,5 @@
 CREATE EXTENSION pg_zega;
+SET zega.password = 'pg_zega-test-token';
 
 CREATE TABLE people (
     person_id int PRIMARY KEY,

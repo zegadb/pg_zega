@@ -9,3 +9,8 @@ serve.sh
 *.o
 *.so
 *.bc
+
+# Local passwords. Never commit these.
+.env
+pg-password
+zega-token

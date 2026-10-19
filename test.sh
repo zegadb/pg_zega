@@ -4,6 +4,11 @@
 set -eu
 cd "$(dirname "$0")"
 
+if [ -z "${POSTGRES_PASSWORD:-}" ]; then
+    POSTGRES_PASSWORD=$(openssl rand -base64 24)
+    export POSTGRES_PASSWORD
+fi
+
 echo "building postgres"
 docker compose down -v >/dev/null 2>&1 || true
 docker compose up --build -d
