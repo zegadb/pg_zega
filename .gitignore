@@ -1,0 +1,11 @@
+# Local harness. The published extension is postgres/.
+zega-data/
+engine/
+explorer-page/
+explorer.mjs
+serve.sh
+
+# PGXS build output
+*.o
+*.so
+*.bc

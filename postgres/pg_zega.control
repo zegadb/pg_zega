@@ -1,0 +1,6 @@
+comment = 'sync tracked tables and their schema into Zega'
+default_version = '0.1'
+module_pathname = '$libdir/pg_zega'
+relocatable = false
+schema = zega
+superuser = true

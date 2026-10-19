@@ -1,0 +1,13 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  postgres-17:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and install on Postgres 17
+        run: docker build -t pg_zega:ci ./postgres
