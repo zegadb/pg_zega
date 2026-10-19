@@ -4,6 +4,8 @@ services:
     build: ./postgres
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      ZEGA_PASSWORD: ${ZEGA_PASSWORD:?Set ZEGA_PASSWORD}
+      ZEGA_URL: ${ZEGA_URL:-http://host.docker.internal:9342}
       POSTGRES_USER: postgres
     ports:
       - "127.0.0.1:5433:5432"
