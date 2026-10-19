@@ -38,27 +38,43 @@ ALTER ROLE postgres WITH PASSWORD '<postgres password>';
 
 Reload Postgres after changing `pg_hba.conf`.
 
-## Images
+## Docker
 
-The same pair is published as two Docker images. Neither image contains a password. Each refuses to start until you pass one.
+Run both servers from the published images. Neither image contains a password. Postgres refuses to start without `POSTGRES_PASSWORD` and `ZEGA_PASSWORD`, and it refuses `POSTGRES_HOST_AUTH_METHOD=trust`. Zega refuses to start without `ZEGA_TOKEN`, or without a non-empty file mounted at `/etc/zega/token`. The token is one word.
 
 | Image | Tags | What it is |
 | --- | --- | --- |
-| `<account>/pg_zega` | `17`, `0.1` | Postgres 17 with pg_zega installed. Requires `POSTGRES_PASSWORD` and `ZEGA_PASSWORD`. |
-| `<account>/zega` | `0.2.0` | Zega 0.2.0 (`zegadb/zega@4ecaf43`). Listens on port 9342. Requires `ZEGA_TOKEN` or a file mounted at `/etc/zega/token`. |
+| `addiscorp/pg_zega` | `17`, `0.1`, `latest` | Postgres 17 with pg_zega installed. |
+| `addiscorp/zega` | `0.2.0`, `latest` | Zega 0.2.0 (`zegadb/zega@4ecaf43`). Listens on port 9342. |
 
-`ZEGA_PASSWORD` and `ZEGA_TOKEN` are the same secret. `POSTGRES_PASSWORD` is the other one. Trust authentication is refused.
+`ZEGA_PASSWORD` and `ZEGA_TOKEN` are the same secret. `POSTGRES_PASSWORD` is a different one. The images are linux/amd64.
 
 ```sh
-export DOCKERHUB_USERNAME=<account>
+export DOCKERHUB_USERNAME=addiscorp
 export POSTGRES_PASSWORD="$(openssl rand -base64 24)"
 export ZEGA_TOKEN="$(openssl rand -base64 32)"
-docker compose -f docker-compose.images.yml up
+docker compose -f docker-compose.images.yml up -d
 ```
 
-That file is a separate compose project named `pg-zega-images`. Postgres is on `127.0.0.1:5433` and Zega is on `127.0.0.1:9342`. Inside the network, Postgres calls Zega at `http://zega:9342`.
+That file is compose project `pg-zega-images`. Postgres is on `127.0.0.1:5433`. Zega is on `127.0.0.1:9342`. Inside the network, Postgres calls Zega at `http://zega:9342`.
 
-GitHub Actions publishes both images when a release is published, and from the Actions tab with "publish". The job uses the `release` environment: secret `DOCKER_TOKEN`, variable `DOCKERHUB_USERNAME`. The workflow on the default branch is the one a release runs.
+A client on the published Postgres port uses `scram-sha-256` and `POSTGRES_PASSWORD`:
+
+```
+postgresql://postgres:<POSTGRES_PASSWORD>@127.0.0.1:5433/postgres
+```
+
+Zega answers 401 until the request carries the bearer:
+
+```sh
+curl -fsS -H "Authorization: Bearer $ZEGA_TOKEN" http://127.0.0.1:9342/health
+```
+
+The first Postgres start creates the extension, preloads it, and sets `zega.password` and `zega.url` from the environment. You do not run `ALTER SYSTEM` for this image. A later start keeps the database and rewrites the password file, so a new `ZEGA_PASSWORD` applies the next time the container starts.
+
+`docker compose -f docker-compose.images.yml down` stops both servers and keeps the volumes. `down -v` deletes the database and the Zega graph.
+
+GitHub Actions pushes the images when a release is published, and when the `publish` workflow is run. The job uses the `release` environment: secret `DOCKER_TOKEN`, variable `DOCKERHUB_USERNAME`. A release runs the workflow file on the default branch.
 
 ## Install
 
@@ -75,21 +91,22 @@ sudo make install
 CREATE EXTENSION pg_zega;
 ```
 
-Set `zega.password` before `zega.track`, as above. `zega.url` is superuser-only. Its default is `http://host.docker.internal:9342`, which is a Zega server on the host as seen from the compose container. On a host install, point it at this machine:
+Set `zega.password` before `zega.track`, as above. `zega.url` is superuser-only. On a host install, point it at Zega on this machine:
 
 ```sql
 ALTER SYSTEM SET zega.url = 'http://127.0.0.1:9342';
 SELECT pg_reload_conf();
 ```
 
-`postgres/Dockerfile` is that same build on `postgres:17-bookworm`. From this repository:
+`postgres/Dockerfile` is that same build on `postgres:17-bookworm`. It does not start Zega. Start Zega on the host first, with the token file from above, then build Postgres against it:
 
 ```sh
 export POSTGRES_PASSWORD="$(openssl rand -base64 24)"
+export ZEGA_PASSWORD="$(tr -d '\n' < zega-token)"
 docker compose up --build -d
 ```
 
-Postgres listens on `127.0.0.1:5433`. Host connections authenticate with `POSTGRES_PASSWORD` using `scram-sha-256`:
+`ZEGA_URL` defaults to `http://host.docker.internal:9342`. Postgres listens on `127.0.0.1:5433` and host connections use `POSTGRES_PASSWORD`:
 
 ```
 postgresql://postgres:<POSTGRES_PASSWORD>@127.0.0.1:5433/postgres
