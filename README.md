@@ -6,6 +6,38 @@ The schema is rendered from the catalog. An `ALTER TABLE` on a tracked table upd
 
 Postgres 17. The extension is superuser-only and links libcurl.
 
+## Passwords
+
+Postgres and Zega each require their own password. One lets a client connect to Postgres. The other is the bearer token Postgres sends to Zega. Use a different secret for each.
+
+Create the Zega token, then start Zega with it. The file holds one word, the bearer token:
+
+```sh
+umask 077
+openssl rand -base64 32 > zega-token
+zega start --data ./zega-data --port 9342 --token-file ./zega-token
+```
+
+Zega then answers 401 unless the request sends `Authorization: Bearer` with that token. That covers reads and writes. A Zega process started without `--token-file` on `127.0.0.1` accepts every caller. That is not a pg_zega setup.
+
+pg_zega will not track a table, import, or sync a commit until the same token is stored in Postgres. Only a superuser can set it, and only a superuser can read it back. It stays out of `SHOW ALL`.
+
+```sql
+CREATE EXTENSION pg_zega;
+ALTER SYSTEM SET zega.password = '<contents of zega-token>';
+SELECT pg_reload_conf();
+```
+
+Open a new session after the reload. Paste the token as one word. Zega ignores a trailing newline in the file, and the Postgres setting is that same word. The extension sends it on every request to Zega.
+
+The compose file below will not create the database until `POSTGRES_PASSWORD` is set. Give the Postgres role that password, and use `scram-sha-256` in `pg_hba.conf` for host connections. On a host install:
+
+```sql
+ALTER ROLE postgres WITH PASSWORD '<postgres password>';
+```
+
+Reload Postgres after changing `pg_hba.conf`.
+
 ## Install
 
 Build it on the Postgres that will load it. The shared library has to match that server's major version and that machine's libcurl.
@@ -21,7 +53,7 @@ sudo make install
 CREATE EXTENSION pg_zega;
 ```
 
-On a host install, point the extension at a Zega server on this machine:
+Set `zega.password` before `zega.track`, as above. `zega.url` is superuser-only. Its default is `http://host.docker.internal:9342`, which is a Zega server on the host as seen from the compose container. On a host install, point it at this machine:
 
 ```sql
 ALTER SYSTEM SET zega.url = 'http://127.0.0.1:9342';
@@ -31,10 +63,15 @@ SELECT pg_reload_conf();
 `postgres/Dockerfile` is that same build on `postgres:17-bookworm`. From this repository:
 
 ```sh
+export POSTGRES_PASSWORD="$(openssl rand -base64 24)"
 docker compose up --build -d
 ```
 
-Postgres listens on `127.0.0.1:5433` as `postgres`, with trust authentication, for a local trial. Inside that container the default `zega.url` is `http://host.docker.internal:9342`, which is a Zega server on the host.
+Postgres listens on `127.0.0.1:5433`. Host connections authenticate with `POSTGRES_PASSWORD` using `scram-sha-256`:
+
+```
+postgresql://postgres:<POSTGRES_PASSWORD>@127.0.0.1:5433/postgres
+```
 
 ## Track a table
 
@@ -162,7 +199,7 @@ This repository is that source. [PGXN](https://pgxn.org/) and distro packages (o
 
 The GitHub Actions workflow builds `postgres/Dockerfile` on every push and pull request. That image runs `make` and `make install` on Postgres 17. The workflow records that the source still compiles. It does not upload a shared library.
 
-`test.sh` is the sync test. It needs a Zega server already listening on `127.0.0.1:9342`. It runs `docker compose down -v` first, which drops this compose project's database volume, then deletes that Zega graph and runs `test.sql`. Run it only against a database you can throw away.
+`test.sh` is the sync test. It generates `POSTGRES_PASSWORD` when you have not set one. It needs a Zega server already listening on `127.0.0.1:9342`, started with `--token-file` containing `pg_zega-test-token` (the value `test.sql` sets). It runs `docker compose down -v` first, which drops this compose project's database volume, then deletes that Zega graph and runs `test.sql`. Run it only against a database you can throw away.
 
 ## License
 

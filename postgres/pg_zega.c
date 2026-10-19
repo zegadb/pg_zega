@@ -15,6 +15,7 @@
 PG_MODULE_MAGIC;
 
 static char *zega_url = NULL;
+static char *zega_password = NULL;
 static StringInfo pending = NULL;
 static int pending_ops = 0;
 
@@ -96,6 +97,42 @@ json_escape_dup(const char *src)
 }
 
 static void
+require_password(void)
+{
+	const unsigned char *p;
+
+	if (zega_password == NULL || zega_password[0] == '\0')
+		ereport(ERROR,
+				(errmsg("pg_zega requires zega.password")));
+	for (p = (const unsigned char *) zega_password; *p != '\0'; p++)
+	{
+		if (*p <= ' ' || *p == 127)
+			ereport(ERROR,
+					(errmsg("pg_zega password must be a single token")));
+	}
+}
+
+static struct curl_slist *
+auth_headers(struct curl_slist *headers)
+{
+	char *line;
+	size_t n;
+	struct curl_slist *next;
+
+	require_password();
+	n = strlen("Authorization: Bearer ") + strlen(zega_password) + 1;
+	line = malloc(n);
+	if (line == NULL)
+		ereport(ERROR, (errmsg("pg_zega ran out of memory")));
+	snprintf(line, n, "Authorization: Bearer %s", zega_password);
+	next = curl_slist_append(headers, line);
+	free(line);
+	if (next == NULL)
+		ereport(ERROR, (errmsg("pg_zega ran out of memory")));
+	return next;
+}
+
+static void
 http_request(const char *url, const char *body, const char *method)
 {
 	CURL *curl;
@@ -105,19 +142,32 @@ http_request(const char *url, const char *body, const char *method)
 	CURLcode rc;
 
 	memset(&response, 0, sizeof(response));
+	headers = auth_headers(NULL);
+	if (body != NULL)
+	{
+		struct curl_slist *next;
+
+		next = curl_slist_append(headers, "Content-Type: application/json");
+		if (next == NULL)
+		{
+			curl_slist_free_all(headers);
+			ereport(ERROR, (errmsg("pg_zega ran out of memory")));
+		}
+		headers = next;
+	}
 	curl = curl_easy_init();
 	if (curl == NULL)
+	{
+		curl_slist_free_all(headers);
 		ereport(ERROR,
 				(errmsg("pg_zega could not start the HTTP client")));
-	if (body != NULL)
-		headers = curl_slist_append(headers, "Content-Type: application/json");
+	}
 	curl_easy_setopt(curl, CURLOPT_URL, url);
 	if (method != NULL)
 		curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
 	if (body != NULL)
 		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
-	if (headers != NULL)
-		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
@@ -364,8 +414,18 @@ _PG_init(void)
 							   NULL,
 							   &zega_url,
 							   "http://host.docker.internal:9342",
-							   PGC_USERSET,
+							   PGC_SUSET,
 							   0,
+							   NULL,
+							   NULL,
+							   NULL);
+	DefineCustomStringVariable("zega.password",
+							   "Bearer token sent to Zega on every sync call.",
+							   NULL,
+							   &zega_password,
+							   NULL,
+							   PGC_SUSET,
+							   GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
 							   NULL,
 							   NULL,
 							   NULL);
@@ -415,10 +475,24 @@ http_get_dup(const char *url)
 	CURLcode rc;
 
 	memset(&buf, 0, sizeof(buf));
+	headers = auth_headers(NULL);
+	{
+		struct curl_slist *next;
+
+		next = curl_slist_append(headers, "Accept: application/json");
+		if (next == NULL)
+		{
+			curl_slist_free_all(headers);
+			ereport(ERROR, (errmsg("pg_zega ran out of memory")));
+		}
+		headers = next;
+	}
 	curl = curl_easy_init();
 	if (curl == NULL)
+	{
+		curl_slist_free_all(headers);
 		ereport(ERROR, (errmsg("pg_zega could not start the HTTP client")));
-	headers = curl_slist_append(headers, "Accept: application/json");
+	}
 	curl_easy_setopt(curl, CURLOPT_URL, url);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, dyn_write);
@@ -507,9 +581,11 @@ PG_FUNCTION_INFO_V1(zega_enqueue);
 Datum
 zega_enqueue(PG_FUNCTION_ARGS)
 {
-	char *chunk = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char *chunk;
 	MemoryContext old;
 
+	require_password();
+	chunk = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	old = MemoryContextSwitchTo(TopMemoryContext);
 	if (pending == NULL)
 		pending = makeStringInfo();
