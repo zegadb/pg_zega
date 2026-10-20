@@ -1,4 +1,4 @@
-CREATE EXTENSION pg_zega;
+CREATE EXTENSION IF NOT EXISTS pg_zega;
 SET zega.password = 'pg_zega-test-token';
 
 CREATE TABLE people (
@@ -14,6 +14,11 @@ INSERT INTO people (person_id, name) VALUES (1, 'Ada "Lovelace"');
 ALTER TABLE people ADD COLUMN email text;
 
 UPDATE people SET email = 'ada@example.com' WHERE person_id = 1;
+
+-- Emptying a column empties it in Zega too.
+ALTER TABLE people ADD COLUMN nickname text;
+UPDATE people SET nickname = 'Countess' WHERE person_id = 1;
+UPDATE people SET nickname = NULL WHERE person_id = 1;
 
 BEGIN;
 INSERT INTO people (person_id, name) VALUES (2, 'Grace Hopper');

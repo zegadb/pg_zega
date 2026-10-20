@@ -559,6 +559,15 @@ BEGIN
             RAISE EXCEPTION 'pg_zega cannot use column %.id; Zega reserves id for the engine id', TG_TABLE_NAME;
         END IF;
         IF rec -> col.name IS NULL OR rec -> col.name = 'null'::jsonb THEN
+            -- An UPDATE that empties a column clears the property in Zega too.
+            IF TG_OP = 'UPDATE' AND col.name <> pk
+               AND COALESCE(to_jsonb(OLD) -> col.name, 'null'::jsonb) <> 'null'::jsonb THEN
+                IF sets = '' THEN
+                    sets := col.name || ': null';
+                ELSE
+                    sets := sets || ', ' || col.name || ': null';
+                END IF;
+            END IF;
             CONTINUE;
         END IF;
         lit := zega.literal(ztype, rec -> col.name);
