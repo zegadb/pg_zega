@@ -47,8 +47,8 @@ clear_pending(void)
 {
 	if (pending != NULL)
 	{
+		/* Frees the buffer and the StringInfo itself. */
 		destroyStringInfo(pending);
-		pfree(pending);
 		pending = NULL;
 	}
 	pending_ops = 0;

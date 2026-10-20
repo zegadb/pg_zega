@@ -1,8 +1,12 @@
 #!/bin/sh
 # Rebuilds this compose project and deletes the graph at http://127.0.0.1:9342.
-# `docker compose down -v` drops the database volume. Start Zega on port 9342 first.
+# `docker compose down -v` drops the database volume. Start Zega on port 9342 first, with
+# ZEGA_TOKEN=pg_zega-test-token (the token test.sql uses).
 set -eu
 cd "$(dirname "$0")"
+
+ZEGA_PASSWORD=pg_zega-test-token
+export ZEGA_PASSWORD
 
 if [ -z "${POSTGRES_PASSWORD:-}" ]; then
     POSTGRES_PASSWORD=$(openssl rand -base64 24)
@@ -17,7 +21,7 @@ echo "waiting for postgres and the host zega"
 ready=0
 i=0
 while [ "$i" -lt 60 ]; do
-    if curl -sf http://127.0.0.1:9342/health >/dev/null && \
+    if curl -sf -H "Authorization: Bearer $ZEGA_PASSWORD" http://127.0.0.1:9342/health >/dev/null && \
        docker compose exec -T postgres pg_isready -U postgres >/dev/null; then
         ready=1
         break
@@ -31,7 +35,7 @@ if [ "$ready" -ne 1 ]; then
     exit 1
 fi
 
-curl -sf -X DELETE http://127.0.0.1:9342/graph >/dev/null
+curl -sf -H "Authorization: Bearer $ZEGA_PASSWORD" -X DELETE http://127.0.0.1:9342/graph >/dev/null
 
 echo "running sync test"
 docker compose exec -T postgres psql -U postgres -v ON_ERROR_STOP=1 < test.sql
@@ -39,7 +43,7 @@ docker compose exec -T postgres psql -U postgres -v ON_ERROR_STOP=1 < test.sql
 python3 - <<'PY'
 import json, urllib.request
 graph = json.load(urllib.request.urlopen(
-    urllib.request.Request("http://127.0.0.1:9342/graph", headers={"Accept": "application/json"})
+    urllib.request.Request("http://127.0.0.1:9342/graph", headers={"Accept": "application/json", "Authorization": "Bearer pg_zega-test-token"})
 ))
 nodes = graph["result"]["nodes"]
 rels = graph["result"]["rels"]
@@ -54,6 +58,7 @@ assert node["name"] == 'Ada "Lovelace"'
 assert node["email"] == "ada@example.com"
 assert node["active"] is True
 assert "photo" not in node
+assert node.get("nickname") is None, node
 assert "Grace" not in json.dumps(nodes)
 assert "temp" not in json.dumps(nodes)
 assert len(rels) == 1, rels
