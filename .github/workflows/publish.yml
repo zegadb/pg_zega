@@ -36,13 +36,3 @@ jobs:
             ${{ vars.DOCKERHUB_USERNAME }}/pg_zega:17
             ${{ vars.DOCKERHUB_USERNAME }}/pg_zega:0.1
             ${{ vars.DOCKERHUB_USERNAME }}/pg_zega:latest
-      - name: Publish the Zega image
-        uses: docker/build-push-action@v6
-        with:
-          context: ./zega
-          push: true
-          tags: |
-            ${{ vars.DOCKERHUB_USERNAME }}/zega:0.2.0
-            ${{ vars.DOCKERHUB_USERNAME }}/zega:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
