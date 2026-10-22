@@ -45,7 +45,7 @@ Run both servers from the published images. Neither image contains a password. P
 | Image | Tags | What it is |
 | --- | --- | --- |
 | `addiscorp/pg_zega` | `17`, `0.1`, `latest` | Postgres 17 with pg_zega installed. |
-| `addiscorp/zega` | `0.2.0`, `latest` | Zega 0.2.0 (`zegadb/zega@4ecaf43`). Listens on port 9342. |
+| `addiscorp/zega` | `0.2.0`, `latest` | Zega 0.2.0, published by [zegadb/zega](https://github.com/zegadb/zega) (`docker/zega`) when a version is promoted. Listens on port 9342. |
 
 `ZEGA_PASSWORD` and `ZEGA_TOKEN` are the same secret. `POSTGRES_PASSWORD` is a different one. The images are linux/amd64.
 
@@ -74,7 +74,7 @@ The first Postgres start creates the extension, preloads it, and sets `zega.pass
 
 `docker compose -f docker-compose.images.yml down` stops both servers and keeps the volumes. `down -v` deletes the database and the Zega graph.
 
-GitHub Actions pushes the images when a release is published, and when the `publish` workflow is run. The job uses the `release` environment: secret `DOCKER_TOKEN`, variable `DOCKERHUB_USERNAME`. A release runs the workflow file on the default branch.
+GitHub Actions pushes the Postgres image when a release is published, and when the `publish` workflow is run. The Zega image is zegadb/zega's own. The job uses the `release` environment: secret `DOCKER_TOKEN`, variable `DOCKERHUB_USERNAME`. A release runs the workflow file on the default branch.
 
 ## Install
 
