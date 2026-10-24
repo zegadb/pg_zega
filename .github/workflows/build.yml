@@ -4,10 +4,36 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
+  # The Postgres image on both architectures Docker users have: amd64 (Linux,
+  # Intel Macs) and arm64 (Apple Silicon, ARM Linux), each built natively and
+  # each starting with pg_zega loaded.
   postgres-17:
-    runs-on: ubuntu-latest
+    name: Postgres 17 (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - name: Compile and install on Postgres 17
-        run: docker build -t pg_zega:ci ./postgres
+        run: docker build --platform ${{ matrix.platform }} -t pg_zega:ci ./postgres
+      - name: It starts with pg_zega loaded on ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect pg_zega:ci --format '{{.Os}}/{{.Architecture}}')" = "${{ matrix.platform }}"
+          docker run -d --name pg-ci -e POSTGRES_PASSWORD=ci-password -e ZEGA_PASSWORD=ci-zega pg_zega:ci
+          for _ in $(seq 1 60); do
+            version="$(docker exec pg-ci psql -U postgres -tAc "SELECT extversion FROM pg_extension WHERE extname = 'pg_zega'" 2>/dev/null || true)"
+            if [ -n "$version" ]; then echo "pg_zega $version loaded on ${{ matrix.platform }}"; exit 0; fi
+            sleep 2
+          done
+          docker logs pg-ci; exit 1
