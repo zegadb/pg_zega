@@ -130,5 +130,41 @@ if relay > "$work/relay-refused.log" 2>&1; then fail "the relay accepted a refus
 grep -q "refused txid" "$work/relay-refused.log" || { cat "$work/relay-refused.log" >&2; fail "no refusal reported"; }
 [ "$(psql -c "SELECT count(*) FROM zega.journal")" = 1 ] || fail "the refused row left zega.journal"
 
+echo "--recover without a full import drops nothing"
+if relay --recover > "$work/recover-none.log" 2>&1; then fail "--recover ran without an import"; fi
+grep -q "run SELECT zega.import()" "$work/recover-none.log" || { cat "$work/recover-none.log" >&2; fail "wrong --recover error"; }
+[ "$(psql -c "SELECT count(*) FROM zega.journal")" = 1 ] || fail "--recover dropped rows without an import"
+
+echo "rows after the refused one wait; an import waits for open writes"
+psql -c "INSERT INTO users (user_id, name) VALUES (13, 'Lin')" >/dev/null
+psql -c "BEGIN; INSERT INTO users (user_id, name) VALUES (14, 'Mo'); SELECT pg_sleep(4); COMMIT;" >/dev/null &
+writer=$!
+sleep 1
+psql -c "SELECT zega.import()" >/dev/null &
+importer=$!
+sleep 1
+[ "$(psql -c "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%zega.import()%'")" = 1 ] ||
+    fail "the import did not wait for the open write"
+wait "$writer" || fail "the open write failed"
+wait "$importer" || fail "the import failed"
+
+echo "--recover drops the rows before the import and delivers it"
+relay --recover > "$work/recover.log" 2>&1 || { cat "$work/recover.log" >&2; fail "--recover failed"; }
+grep -q "dropped txid" "$work/recover.log" || fail "--recover dropped nothing"
+[ "$(psql -c "SELECT count(*) FROM zega.journal")" = 0 ] || fail "rows are left in zega.journal"
+curl -sf -H "Accept: application/json" -H "Authorization: Bearer $ZEGA_PASSWORD" http://127.0.0.1:9342/graph |
+    python3 -c '
+import json, sys
+nodes = json.load(sys.stdin)["result"]["nodes"]
+people = [n for n in nodes if n.get("labels") == ["people"]]
+assert [p.get("badge") for p in people] == ["y"], people
+users = sorted(n["user_id"] for n in nodes if "user_id" in n)
+assert users == [10, 11, 12, 13, 14], users
+' || fail "the recovered graph is not what Postgres holds"
+python3 check-graph.py >/dev/null || fail "the recovered graph lost the test.sql rows"
+psql -c "INSERT INTO users (user_id, name) VALUES (15, 'Pia')" >/dev/null
+relay
+[ "$(psql -c "SELECT count(*) FROM zega.journal")" = 0 ] || fail "the relay did not carry on after --recover"
+
 $compose down -v >/dev/null 2>&1
 echo "pg_zega journal test passed"

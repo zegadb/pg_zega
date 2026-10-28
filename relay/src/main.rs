@@ -10,6 +10,10 @@
 //! A crash anywhere in between redelivers the same row, and Zega answers with
 //! the original receipt, so every transaction is applied once. A delivery
 //! Zega refuses stops the relay: nothing after it is applied out of order.
+//!
+//! To get past a refusal, run `SELECT zega.import()` in Postgres, then the
+//! relay with `--recover`: it drops every row before that import (they are
+//! all in it) and delivers the import, which replaces the whole graph.
 
 use std::time::Duration;
 
@@ -18,10 +22,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 const USAGE: &str = "usage: pg_zega-relay --postgres <connection string> [--postgres-password-file <file>]
-                     --zega <url> --zega-token-file <file> [--slot zega] [--poll-ms 500] [--once]
+                     --zega <url> --zega-token-file <file> [--slot zega] [--poll-ms 500] [--once] [--recover]
 
   --postgres   libpq-style keywords, e.g. \"host=127.0.0.1 port=5433 user=postgres dbname=app\"
-  --once       deliver everything committed so far, then exit";
+  --once       deliver everything committed so far, then exit
+  --recover    after a refusal and a `SELECT zega.import()`: drop every journal row
+               before that import, deliver it, then carry on";
 
 struct Options {
     postgres: String,
@@ -31,6 +37,7 @@ struct Options {
     slot: String,
     poll: Duration,
     once: bool,
+    recover: bool,
 }
 
 /// One committed transaction, as the output plugin writes it.
@@ -96,6 +103,7 @@ fn options(args: Vec<String>) -> Result<Options, String> {
     let mut slot = "zega".to_string();
     let mut poll = Duration::from_millis(500);
     let mut once = false;
+    let mut recover = false;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -110,6 +118,7 @@ fn options(args: Vec<String>) -> Result<Options, String> {
                 poll = Duration::from_millis(ms.parse().map_err(|_| format!("--poll-ms {ms} is not a number"))?);
             }
             "--once" => once = true,
+            "--recover" => recover = true,
             "--help" | "-h" => return Err("pg_zega-relay".into()),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -122,6 +131,7 @@ fn options(args: Vec<String>) -> Result<Options, String> {
         slot,
         poll,
         once,
+        recover,
     })
 }
 
@@ -145,6 +155,9 @@ fn run(options: &Options) -> Result<(), Stop> {
     ensure_slot(&mut db, &options.slot)?;
     eprintln!("pg_zega-relay: {source_id}, slot {}, to {}", options.slot, options.zega);
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    if options.recover {
+        recover(&mut db, &agent, options, &source_id)?;
+    }
     loop {
         let delivered = drain(&mut db, &agent, options, &source_id)?;
         if options.once && delivered == 0 {
@@ -192,6 +205,57 @@ fn ensure_slot(db: &mut Client, slot: &str) -> Result<(), Stop> {
 
 const BATCH: i32 = 100;
 
+/// The flush of `zega.import()`: the whole graph.
+fn replaces_everything(entry: &Entry) -> bool {
+    entry.flush.as_ref().and_then(|flush| flush.get("all")) == Some(&Value::Bool(true))
+}
+
+/// Drop the rows before the oldest waiting `zega.import()`, in commit order,
+/// then deliver it. That import holds every change those rows held: it locks
+/// the tracked tables against writes before reading them, so anything
+/// committed before it is in it. Without one waiting, nothing is dropped.
+fn recover(db: &mut Client, agent: &ureq::Agent, options: &Options, source_id: &str) -> Result<(), Stop> {
+    let slot = options.slot.as_str();
+    let imports: i64 = db
+        .query_one("SELECT count(*) FROM zega.journal WHERE flush @> '{\"all\": true}'", &[])?
+        .get(0);
+    if imports == 0 {
+        return Err(Stop::Other(
+            "--recover needs a full import to deliver: run SELECT zega.import() in this database first".into(),
+        ));
+    }
+    loop {
+        let upto: String = db.query_one("SELECT pg_current_wal_flush_lsn()::text", &[])?.get(0);
+        let rows = db.query(
+            "SELECT lsn::text, data FROM pg_logical_slot_peek_changes($1, $2::text::pg_lsn, $3)",
+            &[&slot, &upto, &BATCH],
+        )?;
+        if rows.is_empty() {
+            return Err(Stop::Other(format!("slot {slot} has no full import to deliver")));
+        }
+        for row in &rows {
+            let lsn: String = row.get(0);
+            let entry = entry(&row.get::<_, String>(1))?;
+            let import = replaces_everything(&entry);
+            if import {
+                deliver(agent, options, source_id, &entry)?;
+            }
+            db.execute("DELETE FROM zega.journal WHERE txid = $1::text::xid8", &[&entry.txid])?;
+            db.execute("SELECT pg_replication_slot_advance($1, $2::text::pg_lsn)", &[&slot, &lsn])?;
+            if import {
+                eprintln!("pg_zega-relay: recovered: delivered the import txid {} at {lsn}", entry.txid);
+                return Ok(());
+            }
+            eprintln!("pg_zega-relay: dropped txid {} at {lsn}; the import replaces it", entry.txid);
+        }
+    }
+}
+
+fn entry(data: &str) -> Result<Entry, Stop> {
+    serde_json::from_str(data)
+        .map_err(|error| Stop::Other(format!("the slot emitted something that is not a journal entry ({error}): {data}")))
+}
+
 /// Deliver what has committed up to now, in commit order; returns how many
 /// transactions were delivered.
 fn drain(db: &mut Client, agent: &ureq::Agent, options: &Options, source_id: &str) -> Result<usize, Stop> {
@@ -205,9 +269,7 @@ fn drain(db: &mut Client, agent: &ureq::Agent, options: &Options, source_id: &st
     )?;
     for row in &rows {
         let lsn: String = row.get(0);
-        let data: String = row.get(1);
-        let entry: Entry = serde_json::from_str(&data)
-            .map_err(|error| Stop::Other(format!("the slot emitted something that is not a journal entry ({error}): {data}")))?;
+        let entry = entry(&row.get::<_, String>(1))?;
         deliver(agent, options, source_id, &entry)?;
         // Delete, then move the slot: a crash between the two redelivers the
         // row (Zega returns its receipt) and never strands it in the table.
