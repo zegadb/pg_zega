@@ -4,7 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcurl4-openssl-dev \
     postgresql-server-dev-17 \
     && rm -rf /var/lib/apt/lists/*
-COPY pg_zega.c pg_zega.control pg_zega--0.1.sql pg_zega--0.2.sql pg_zega--0.1--0.2.sql Makefile /build/pg_zega/
+COPY pg_zega.c pg_zega.control pg_zega--0.1.sql pg_zega--0.2.sql pg_zega--0.3.sql pg_zega--0.1--0.2.sql pg_zega--0.2--0.3.sql Makefile /build/pg_zega/
 WORKDIR /build/pg_zega
 RUN make && make install
 

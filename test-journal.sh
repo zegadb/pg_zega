@@ -91,6 +91,10 @@ psql < test.sql >/dev/null
 journaled=$(waiting)
 [ "$journaled" -gt 0 ] || fail "nothing was journaled"
 echo "journaled $journaled transactions"
+status() {
+    psql -c "SELECT worker_running, waiting, oldest_waiting IS NOT NULL, lag > interval '0', retained_wal_bytes > 0 FROM zega.delivery_status"
+}
+[ "$(status)" = "t|$journaled|t|t|t" ] || fail "zega.delivery_status does not show the waiting rows: $(status)"
 
 i=0
 until worker_log | grep -q "not delivered yet"; do
@@ -103,6 +107,7 @@ echo "Zega comes up; the worker delivers them in commit order: the same graph as
 start_zega
 delivered "the worker did not deliver after Zega came up"
 python3 check-graph.py >/dev/null || fail "the delivered graph differs from precommit's"
+[ "$(status)" = "t|0|f||t" ] || fail "zega.delivery_status still shows rows waiting: $(status)"
 
 echo "a commit reaches Zega without anyone running anything"
 before=$(nodes)
