@@ -60,6 +60,7 @@ signature='SELECT p.proname::text || pg_get_function_identity_arguments(p.oid) |
              JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
             WHERE n.nspname = '"'zega'"' GROUP BY c.oid, c.relname, c.relkind
            ORDER BY 1'
+mkdir -p .tmp
 for from in fresh 0.1 0.2; do
     db=upgrade_$(echo "$from" | tr . _)
     pg -c "DROP DATABASE IF EXISTS $db" >/dev/null 2>&1
