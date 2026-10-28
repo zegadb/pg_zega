@@ -134,17 +134,22 @@ delivered "the breaking change was not delivered"
 graph | python3 -c 'import json,sys; people=[n for n in json.load(sys.stdin)["result"]["nodes"] if n.get("labels")==["people"]]; assert [p.get("code") for p in people]==["x"], people' ||
     fail "people were not reloaded with the new column"
 
-echo "a change Zega refuses holds the journal"
+echo "a change Zega refuses holds the journal; the rows before it in its batch are delivered"
+kill "$zega_pid"; wait "$zega_pid" 2>/dev/null || true; zega_pid=
+psql -c "INSERT INTO users (user_id, name) VALUES (19, 'Uma')" >/dev/null
 psql -c "ALTER TABLE people ADD COLUMN badge text NOT NULL DEFAULT 'y'" >/dev/null
+psql -c "INSERT INTO users (user_id, name) VALUES (13, 'Lin')" >/dev/null
+start_zega
 i=0
 until worker_log | grep -q "Zega refused txid"; do
     i=$((i + 1))
     if [ "$i" -gt 60 ]; then fail "no refusal logged"; fi
     sleep 0.5
 done
-psql -c "INSERT INTO users (user_id, name) VALUES (13, 'Lin')" >/dev/null
 sleep 3
-[ "$(waiting)" = 2 ] || fail "rows after the refused one were not held"
+[ "$(waiting)" = 2 ] || fail "the refused row and the one after it were not held: $(waiting) waiting"
+graph | python3 -c 'import json,sys; assert any(n.get("user_id") == 19 for n in json.load(sys.stdin)["result"]["nodes"])' ||
+    fail "Uma, before the refused row, was not delivered"
 
 echo "an import waits for open writes"
 psql -c "BEGIN; INSERT INTO users (user_id, name) VALUES (14, 'Mo'); SELECT pg_sleep(4); COMMIT;" >/dev/null &
@@ -168,7 +173,7 @@ nodes = json.load(sys.stdin)["result"]["nodes"]
 people = [n for n in nodes if n.get("labels") == ["people"]]
 assert [p.get("badge") for p in people] == ["y"], people
 users = sorted(n["user_id"] for n in nodes if "user_id" in n)
-assert users == [10, 11, 12, 13, 14], users
+assert users == [10, 11, 12, 13, 14, 19], users
 ' || fail "the recovered graph is not what Postgres holds"
 python3 check-graph.py >/dev/null || fail "the recovered graph lost the test.sql rows"
 psql -c "INSERT INTO users (user_id, name) VALUES (15, 'Pia')" >/dev/null
@@ -191,7 +196,7 @@ delivered "the worker did not carry on after the crash"
 graph | python3 -c '
 import json, sys
 users = {n["user_id"]: n.get("name") for n in json.load(sys.stdin)["result"]["nodes"] if "user_id" in n}
-assert sorted(users) == [10, 11, 12, 13, 14, 15, 16, 17], users
+assert sorted(users) == [10, 11, 12, 13, 14, 15, 16, 17, 19], users
 assert users[16] == "Quinn", users[16]
 ' || fail "a row delivered before the crash was applied again"
 worker_log | grep -q "was delivered before; skipped" || fail "the slot did not decode the delivered rows again"
