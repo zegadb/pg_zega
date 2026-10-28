@@ -2,13 +2,63 @@
 
 -- Journal mode (zega.mode = journal): one row per transaction that changed
 -- what Zega holds, written in that transaction. The relay delivers each row
--- to Zega in commit order, then deletes it.
+-- to Zega in commit order, then deletes it. flush is what zega.import
+-- empties first ({"all": true}, or "labels" and "relationships").
 CREATE TABLE journal (
     txid xid8 PRIMARY KEY,
-    schema text NOT NULL,
+    flush jsonb,
+    schema text,
     document text NOT NULL,
     written_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
+
+CREATE OR REPLACE FUNCTION flush_node(label text)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    graph jsonb;
+    node record;
+BEGIN
+    -- Journal mode names the type: Zega finds its nodes when the entry is
+    -- delivered, after every earlier entry.
+    IF current_setting('zega.mode', true) = 'journal' THEN
+        PERFORM zega.enqueue('FN ' || label);
+        RETURN;
+    END IF;
+    graph := zega.read_graph();
+    FOR node IN
+        SELECT elem
+        FROM jsonb_array_elements(COALESCE(graph->'nodes', '[]'::jsonb)) AS elem
+        WHERE elem->'labels' ? label
+    LOOP
+        PERFORM zega.enqueue('DN ' || (node.elem->>'id'));
+    END LOOP;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION flush_edge(field text)
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    graph jsonb;
+    rel record;
+BEGIN
+    IF current_setting('zega.mode', true) = 'journal' THEN
+        PERFORM zega.enqueue('FR ' || field);
+        RETURN;
+    END IF;
+    graph := zega.read_graph();
+    FOR rel IN
+        SELECT elem
+        FROM jsonb_array_elements(COALESCE(graph->'rels', '[]'::jsonb)) AS elem
+        WHERE elem->>'type' = field
+    LOOP
+        PERFORM zega.enqueue('DR ' || (rel.elem->>'id'));
+    END LOOP;
+END;
+$$;
 
 -- Flush a scope in Zega, then load it from Postgres.
 -- import() replaces the whole graph.
@@ -28,10 +78,6 @@ DECLARE
     edge_shp record;
     edges oid[] := ARRAY[]::oid[];
 BEGIN
-    IF current_setting('zega.mode', true) = 'journal' THEN
-        RAISE EXCEPTION 'pg_zega import is not available in journal mode'
-            USING HINT = 'Set zega.mode to precommit for the import.';
-    END IF;
     PERFORM zega.prepare_reload();
     IF target IS NULL THEN
         IF NOT EXISTS (SELECT 1 FROM zega.tracked) THEN

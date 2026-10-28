@@ -12,6 +12,7 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/json.h"
+#include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -277,26 +278,64 @@ flush_id(const char *chunk)
 	return id;
 }
 
-/* Journal mode: this transaction's schema and document become one row. */
+/*
+ * Journal mode: this transaction's flush, schema and document become one
+ * row. The flush (JSON, as a delivery's "flush") and the schema may be NULL.
+ */
 static void
-journal_insert(const char *schema, const char *document)
+journal_insert(const char *flush, const char *schema, const char *document)
 {
-	Oid types[2] = {TEXTOID, TEXTOID};
-	Datum values[2];
+	Oid types[3] = {TEXTOID, TEXTOID, TEXTOID};
+	Datum values[3];
+	char nulls[3] = {' ', ' ', ' '};
 	int rc;
 
-	values[0] = CStringGetTextDatum(schema);
-	values[1] = CStringGetTextDatum(document);
+	values[0] = flush != NULL ? CStringGetTextDatum(flush) : (Datum) 0;
+	values[1] = schema != NULL ? CStringGetTextDatum(schema) : (Datum) 0;
+	values[2] = CStringGetTextDatum(document);
+	if (flush == NULL)
+		nulls[0] = 'n';
+	if (schema == NULL)
+		nulls[1] = 'n';
 	PushActiveSnapshot(GetTransactionSnapshot());
 	if (SPI_connect() != SPI_OK_CONNECT)
 		ereport(ERROR, (errmsg("pg_zega could not write the journal")));
 	rc = SPI_execute_with_args(
-		"INSERT INTO zega.journal (txid, schema, document) VALUES (pg_current_xact_id(), $1, $2)",
-		2, types, values, NULL, false, 0);
+		"INSERT INTO zega.journal (txid, flush, schema, document) VALUES (pg_current_xact_id(), $1::jsonb, $2, $3)",
+		3, types, values, nulls, false, 0);
 	if (rc != SPI_OK_INSERT)
 		ereport(ERROR, (errmsg("pg_zega could not write the journal (%d)", rc)));
 	SPI_finish();
 	PopActiveSnapshot();
+}
+
+/* Add one name to a flush list ("labels" or "relationships"). */
+static void
+append_name(StringInfo list, const char *name)
+{
+	if (list->len > 0)
+		appendStringInfoChar(list, ',');
+	escape_json(list, name);
+}
+
+/*
+ * The flush of a journal entry: everything after an "R", else the labels
+ * and relationship types import named with "FN" and "FR". NULL for none.
+ */
+static char *
+flush_json(int reset, StringInfo labels, StringInfo relationships)
+{
+	StringInfoData flush;
+
+	if (!reset && labels->len == 0 && relationships->len == 0)
+		return NULL;
+	initStringInfo(&flush);
+	if (reset)
+		appendStringInfoString(&flush, "{\"all\":true}");
+	else
+		appendStringInfo(&flush, "{\"labels\":[%s],\"relationships\":[%s]}",
+						 labels->data, relationships->data);
+	return flush.data;
 }
 
 static void
@@ -322,9 +361,15 @@ post_apply(void)
 	char url[1024];
 	const char *base;
 	int reset = 0;
+	StringInfo flush_labels;
+	StringInfo flush_rels;
+	char *flush = NULL;
 
 	if (pending_ops == 0)
 		return;
+
+	flush_labels = makeStringInfo();
+	flush_rels = makeStringInfo();
 
 	base = zega_url != NULL ? zega_url : "http://host.docker.internal:9342";
 	copy = strdup(pending->data);
@@ -343,6 +388,10 @@ post_apply(void)
 			append_id(&node_ids, &node_n, &node_cap, flush_id(chunk));
 		else if (strncmp(chunk, "DR ", 3) == 0)
 			append_id(&rel_ids, &rel_n, &rel_cap, flush_id(chunk));
+		else if (strncmp(chunk, "FN ", 3) == 0)
+			append_name(flush_labels, chunk + 3);
+		else if (strncmp(chunk, "FR ", 3) == 0)
+			append_name(flush_rels, chunk + 3);
 		else if (strncmp(chunk, "schema", 6) == 0)
 			schema = chunk;
 		else
@@ -367,18 +416,26 @@ post_apply(void)
 	}
 
 	/*
-	 * A flush names engine ids read from Zega now; a journal entry is applied
-	 * later, when those ids may mean nothing.
+	 * Precommit mode flushes engine ids read from Zega now (DN, DR). A
+	 * journal entry is applied later, when those ids may mean nothing, so
+	 * journal mode names what to flush by type (FN, FR) and Zega finds it
+	 * when the entry is delivered.
 	 */
-	if (zega_mode == ZEGA_MODE_JOURNAL && (reset || node_n > 0 || rel_n > 0))
+	if ((zega_mode == ZEGA_MODE_JOURNAL && (node_n > 0 || rel_n > 0))
+		|| (zega_mode == ZEGA_MODE_PRECOMMIT && (flush_labels->len > 0 || flush_rels->len > 0)))
 	{
 		free(copy);
 		free(mutations);
 		free(node_ids);
 		free(rel_ids);
 		ereport(ERROR,
-				(errmsg("pg_zega import is not available in journal mode"),
-				 errhint("Set zega.mode to precommit for the import.")));
+				(errmsg("pg_zega flush does not match zega.mode"),
+				 errhint("Run the import and its commit under the same zega.mode.")));
+	}
+	if (zega_mode == ZEGA_MODE_JOURNAL)
+	{
+		flush = flush_json(reset, flush_labels, flush_rels);
+		reset = 0;
 	}
 
 	if (reset)
@@ -409,6 +466,9 @@ post_apply(void)
 		if (mutations_len > 0)
 			ereport(ERROR,
 					(errmsg("pg_zega sync has row changes and no schema")));
+		/* Nothing is tracked any more: the entry empties the graph. */
+		if (flush != NULL)
+			journal_insert(flush, NULL, "");
 		return;
 	}
 
@@ -437,7 +497,7 @@ post_apply(void)
 	{
 		PG_TRY();
 		{
-			journal_insert(schema_text, document);
+			journal_insert(flush, schema_text, document);
 		}
 		PG_FINALLY();
 		{
@@ -694,7 +754,7 @@ zega_enqueue(PG_FUNCTION_ARGS)
 /*
  * The logical decoding output plugin: pg_create_logical_replication_slot(
  * 'zega', 'pg_zega'). Each committed transaction that wrote a zega.journal
- * row is one line of JSON, {"txid", "schema", "document"}, at the commit's
+ * row is one line of JSON, {"txid", "flush", "schema", "document"}, at the commit's
  * LSN, in commit order. Everything else is skipped.
  */
 static void
@@ -725,6 +785,24 @@ journal_text(HeapTuple tuple, TupleDesc desc, const char *column)
 	return isnull ? NULL : TextDatumGetCString(value);
 }
 
+/* A jsonb column as JSON text; NULL when the column is NULL. */
+static char *
+journal_json(HeapTuple tuple, TupleDesc desc, const char *column)
+{
+	int attnum = SPI_fnumber(desc, column);
+	bool isnull;
+	Datum value;
+	Jsonb *json;
+
+	if (attnum <= 0)
+		ereport(ERROR, (errmsg("pg_zega journal has no column %s", column)));
+	value = heap_getattr(tuple, attnum, desc, &isnull);
+	if (isnull)
+		return NULL;
+	json = DatumGetJsonbP(value);
+	return JsonbToCString(NULL, &json->root, VARSIZE(json));
+}
+
 static void
 journal_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			   Relation relation, ReorderBufferChange *change)
@@ -733,6 +811,7 @@ journal_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	HeapTuple tuple;
 	MemoryContext old;
 	StringInfoData line;
+	char *flush;
 	char *schema;
 	char *document;
 	bool isnull;
@@ -752,16 +831,21 @@ journal_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	txid = heap_getattr(tuple, SPI_fnumber(desc, "txid"), desc, &isnull);
 	if (isnull)
 		ereport(ERROR, (errmsg("pg_zega journal row has no txid")));
+	flush = journal_json(tuple, desc, "flush");
 	schema = journal_text(tuple, desc, "schema");
 	document = journal_text(tuple, desc, "document");
-	if (schema == NULL || document == NULL)
+	if (document == NULL)
 		ereport(ERROR, (errmsg("pg_zega journal row is incomplete")));
 
 	old = MemoryContextSwitchTo(ctx->context);
 	initStringInfo(&line);
-	appendStringInfo(&line, "{\"txid\":\"" UINT64_FORMAT "\",\"schema\":",
-					 U64FromFullTransactionId(DatumGetFullTransactionId(txid)));
-	escape_json(&line, schema);
+	appendStringInfo(&line, "{\"txid\":\"" UINT64_FORMAT "\",\"flush\":%s,\"schema\":",
+					 U64FromFullTransactionId(DatumGetFullTransactionId(txid)),
+					 flush != NULL ? flush : "null");
+	if (schema != NULL)
+		escape_json(&line, schema);
+	else
+		appendStringInfoString(&line, "null");
 	appendStringInfoString(&line, ",\"document\":");
 	escape_json(&line, document);
 	appendStringInfoChar(&line, '}');

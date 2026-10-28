@@ -48,7 +48,7 @@ psql() {
     $compose exec -T postgres psql -U postgres -v ON_ERROR_STOP=1 -tA "$@"
 }
 relay() {
-    "$relay_bin" --postgres "host=127.0.0.1 port=5433 user=postgres dbname=postgres" \
+    "$relay_bin" --postgres "host=127.0.0.1 port=${PG_ZEGA_TEST_PORT:-5433} user=postgres dbname=postgres" \
         --postgres-password-file "$work/pg-password" \
         --zega http://127.0.0.1:9342 --zega-token-file "$work/token" --once "$@"
 }
@@ -104,15 +104,31 @@ relay --slot zega_replay
 [ "$(nodes)" = "$after" ] || fail "a redelivery wrote again"
 python3 check-graph.py >/dev/null || fail "a redelivery changed the graph"
 
+echo "zega.import journals what to flush by type; Zega flushes it on delivery"
+psql -c "SELECT zega.import()" >/dev/null
+psql -c "SELECT zega.import('users')" >/dev/null
+[ "$(psql -c "SELECT count(*) FROM zega.journal WHERE flush IS NOT NULL")" = 2 ] || fail "the imports journaled no flush"
+relay
+python3 check-graph.py >/dev/null || fail "an import changed the graph"
+[ "$(nodes)" = "$after" ] || fail "an import lost or duplicated nodes"
+
+echo "a breaking change commits with its import, as one delivery"
+psql <<'SQL' >/dev/null
+BEGIN;
+ALTER TABLE people ADD COLUMN code text NOT NULL DEFAULT 'x';
+SELECT zega.import('people');
+COMMIT;
+SQL
+relay
+curl -sf -H "Accept: application/json" -H "Authorization: Bearer $ZEGA_PASSWORD" http://127.0.0.1:9342/graph |
+    python3 -c 'import json,sys; people=[n for n in json.load(sys.stdin)["result"]["nodes"] if n.get("labels")==["people"]]; assert [p.get("code") for p in people]==["x"], people' ||
+    fail "people were not reloaded with the new column"
+
 echo "a change Zega refuses stops the relay and stays journaled"
-psql -c "ALTER TABLE people ADD COLUMN code text NOT NULL DEFAULT 'x'" >/dev/null
+psql -c "ALTER TABLE people ADD COLUMN badge text NOT NULL DEFAULT 'y'" >/dev/null
 if relay > "$work/relay-refused.log" 2>&1; then fail "the relay accepted a refused delivery"; fi
 grep -q "refused txid" "$work/relay-refused.log" || { cat "$work/relay-refused.log" >&2; fail "no refusal reported"; }
 [ "$(psql -c "SELECT count(*) FROM zega.journal")" = 1 ] || fail "the refused row left zega.journal"
-
-echo "zega.import is refused in journal mode"
-if psql -c "SELECT zega.import('people')" > "$work/import.log" 2>&1; then fail "import ran in journal mode"; fi
-grep -q "not available in journal mode" "$work/import.log" || { cat "$work/import.log" >&2; fail "wrong import error"; }
 
 $compose down -v >/dev/null 2>&1
 echo "pg_zega journal test passed"

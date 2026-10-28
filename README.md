@@ -232,7 +232,7 @@ Engine ids are new after a reload. Edges are linked again from the foreign-key c
 
 ## Journal mode
 
-By default (`zega.mode = precommit`) a commit waits for Zega, and a refusal rolls it back. In journal mode, Postgres commits without calling Zega. Each transaction that changes what Zega holds writes one row to `zega.journal` instead: the schema and the document precommit mode would have sent. A relay beside Zega delivers those rows in commit order. Postgres does not need `zega.password` in this mode; the relay holds the Zega token.
+By default (`zega.mode = precommit`) a commit waits for Zega, and a refusal rolls it back. In journal mode, Postgres commits without calling Zega. Each transaction that changes what Zega holds writes one row to `zega.journal` instead: the schema and the document precommit mode would have sent, and what `zega.import` flushes first. A relay beside Zega delivers those rows in commit order. Postgres does not need `zega.password` in this mode; the relay holds the Zega token.
 
 Journal mode needs logical decoding with pg_zega trusted as an output plugin: `wal_level = logical` (which takes a restart) and `output_plugin_libraries = 'pg_zega'` (Postgres 17.x releases that have that setting refuse any plugin it does not name, superusers included). Start the relay once before switching. On its first run it creates the replication slot `zega`, which uses pg_zega's output plugin. It refuses to create the slot while `zega.journal` has rows, because a slot only sees what commits after it exists. Then set the mode for the database. Only a superuser can:
 
@@ -254,9 +254,9 @@ relay/target/release/pg_zega-relay \
 - A crash at any point redelivers the same row. Zega answers with the receipt and writes nothing twice.
 - While Zega is down, Postgres keeps committing and the relay retries the same row.
 - If Zega refuses a row (for example a schema change its data cannot take), the relay stops and names the `txid`. The row stays in `zega.journal` and in the slot. Nothing after it is delivered, so the order holds.
-- `zega.import` is not available in journal mode yet. Set `zega.mode` to `precommit` for the import, then back.
+- `zega.import` works in journal mode the same way, with one difference: it does not ask Zega which nodes to remove. Its row names the types to flush (`flush` in `zega.journal`), and Zega removes them when the row is delivered, after every earlier row. A breaking change and its import still commit together and reach Zega as one delivery.
 
-`--once` delivers everything committed so far, then exits. `test-journal.sh <zega binary> <relay binary>` runs `test.sql` in journal mode and checks that the graph matches precommit mode. It also covers a restart of Zega, a full redelivery from a second slot, and a refused change.
+`--once` delivers everything committed so far, then exits. `test-journal.sh <zega binary> <relay binary>` runs `test.sql` in journal mode and checks that the graph matches precommit mode. It also covers a restart of Zega, a full redelivery from a second slot, `zega.import` (including a breaking change committed with its import), and a refused change.
 
 ## Build on GitHub
 
