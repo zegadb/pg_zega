@@ -37,7 +37,9 @@ struct Options {
 #[derive(Deserialize)]
 struct Entry {
     txid: String,
-    schema: String,
+    /// What `zega.import` empties first, as the delivery's `flush`.
+    flush: Option<serde_json::Value>,
+    schema: Option<String>,
     document: String,
 }
 
@@ -228,12 +230,15 @@ fn drain(db: &mut Client, agent: &ureq::Agent, options: &Options, source_id: &st
 /// `POST /deliveries` until Zega answers. An unknown outcome (no answer, or
 /// 503) is retried with the identical request; any other refusal stops.
 fn deliver(agent: &ureq::Agent, options: &Options, source_id: &str, entry: &Entry) -> Result<(), Stop> {
-    let body = json!({
+    let mut body = json!({
         "source_id": source_id,
         "txid": entry.txid,
         "schema": entry.schema,
         "document": entry.document,
     });
+    if let Some(flush) = &entry.flush {
+        body["flush"] = flush.clone();
+    }
     let mut wait = Duration::from_millis(200);
     loop {
         let sent = agent
