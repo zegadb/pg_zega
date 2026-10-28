@@ -169,5 +169,27 @@ python3 check-graph.py >/dev/null || fail "the recovered graph lost the test.sql
 psql -c "INSERT INTO users (user_id, name) VALUES (15, 'Pia')" >/dev/null
 delivered "the worker did not carry on after the recovery"
 
+echo "after a crash the slot decodes delivered rows again; the worker skips them"
+psql -c "CHECKPOINT" >/dev/null
+psql -c "INSERT INTO users (user_id, name) VALUES (16, 'Quin')" >/dev/null
+psql -c "UPDATE users SET name = 'Quinn' WHERE user_id = 16" >/dev/null
+delivered "Quin was not delivered"
+refusals=$(worker_log | grep -c "Zega refused" || true)
+# Ray waits in the journal, so the worker decodes again after the crash.
+kill "$zega_pid"; wait "$zega_pid" 2>/dev/null || true; zega_pid=
+psql -c "INSERT INTO users (user_id, name) VALUES (17, 'Ray')" >/dev/null
+$compose kill -s SIGKILL postgres >/dev/null 2>&1
+$compose start postgres >/dev/null 2>&1
+start_zega
+delivered "the worker did not carry on after the crash"
+[ "$(worker_log | grep -c "Zega refused" || true)" = "$refusals" ] || fail "Zega refused a row after the crash"
+graph | python3 -c '
+import json, sys
+users = {n["user_id"]: n.get("name") for n in json.load(sys.stdin)["result"]["nodes"] if "user_id" in n}
+assert sorted(users) == [10, 11, 12, 13, 14, 15, 16, 17], users
+assert users[16] == "Quinn", users[16]
+' || fail "a row delivered before the crash was applied again"
+worker_log | grep -q "was delivered before; skipped" || fail "the slot did not decode the delivered rows again"
+
 $compose down -v >/dev/null 2>&1
 echo "pg_zega journal test passed"

@@ -45,7 +45,7 @@ Run both servers from the published images. Neither image contains a password. P
 | Image | Tags | What it is |
 | --- | --- | --- |
 | `addiscorp/pg_zega` | `17`, `0.2`, `latest` | Postgres 17 with pg_zega installed. |
-| `addiscorp/zega` | `0.2.0`, `latest` | Zega 0.2.0, published by [zegadb/zega](https://github.com/zegadb/zega) (`docker/zega`) when a version is promoted. Listens on port 9342. |
+| `addiscorp/zega` | `0.2.3`, `latest` | Zega 0.2.3 (journal mode needs 0.2.3 or later), published by [zegadb/zega](https://github.com/zegadb/zega) (`docker/zega`) when a version is promoted. Listens on port 9342. |
 
 `ZEGA_PASSWORD` and `ZEGA_TOKEN` are the same secret. `POSTGRES_PASSWORD` is a different one. The images are linux/amd64.
 
@@ -260,6 +260,7 @@ How it works:
 - The worker creates the logical replication slot `zega` (pg_zega's output plugin) when it starts. A slot only sees what commits after it exists, so set the mode once `SELECT slot_name FROM pg_replication_slots` shows it. If `zega.journal` already has rows without a slot, the worker logs a warning and creates none.
 - For each committed row, the worker calls Zega's `POST /deliveries`. The identity is `pg:<system identifier>:<database oid>` and the transaction's `xid8`. Zega applies the flush, the schema and the document as one transaction and keeps a receipt with them. Then the worker deletes the row and moves the slot past it.
 - A crash at any point redelivers the same row. Zega answers with the receipt and writes nothing twice.
+- Each delivery tells Zega to forget the database's earlier receipts (`forget_earlier`), so Zega keeps one receipt per database. That is safe because a row is only sent while it is still in `zega.journal`: after a Postgres crash the slot may decode delivered rows again (its position reaches the disk at checkpoints), and the worker skips them.
 - While Zega is down, Postgres keeps committing and the worker retries the same row (a `LOG` line each time).
 - `zega.import` works the same way, with one difference: it does not ask Zega which nodes to remove. Its row names the types to flush (`flush` in `zega.journal`), and Zega removes them when the row is delivered, after every earlier row. A breaking change and its import still commit together and reach Zega as one delivery.
 - If Zega refuses a row (for example a schema change its data cannot take), the worker logs a `WARNING` with Zega's reason and holds it. Nothing after it is delivered, so the order holds.

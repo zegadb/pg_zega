@@ -2,7 +2,7 @@
 name: pg-zega-images
 services:
   zega:
-    image: ${DOCKERHUB_USERNAME}/zega:0.2.2
+    image: ${DOCKERHUB_USERNAME}/zega:0.2.3
     environment:
       ZEGA_TOKEN: ${ZEGA_TOKEN:?Set ZEGA_TOKEN}
     volumes:

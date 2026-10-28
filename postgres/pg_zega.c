@@ -925,8 +925,12 @@ delivery_send(DeliveryRow *row)
 	const char *base = zega_url != NULL ? zega_url : "http://host.docker.internal:9342";
 
 	initStringInfo(&body);
-	/* The line is {"txid": ...}: the identity goes first. */
-	appendStringInfo(&body, "{\"source_id\":\"%s\",%s", delivery_source, row->data + 1);
+	/*
+	 * The line is {"txid": ...}: the identity goes first. Every earlier row
+	 * is out of zega.journal, so it is never sent again (delivery_journaled):
+	 * Zega can forget its receipts.
+	 */
+	appendStringInfo(&body, "{\"source_id\":\"%s\",\"forget_earlier\":true,%s", delivery_source, row->data + 1);
 	snprintf(url, sizeof(url), "%s/deliveries", base);
 	rc = http_call(url, body.data, NULL, &status, &response);
 	pfree(body.data);
@@ -966,6 +970,27 @@ delivery_done(DeliveryRow *row)
 								 1, types + 1, values + 1, NULL, false, 0) < 0)
 		ereport(ERROR, (errmsg("pg_zega could not mark txid %s delivered", txid)));
 	delivery_end();
+}
+
+/*
+ * Is this row still in zega.journal? A row delivered before is not: the slot
+ * is moved past each row when it is deleted, but that move reaches the disk
+ * only at a checkpoint, so after a crash the slot decodes those rows again.
+ */
+static bool
+delivery_journaled(DeliveryRow *row)
+{
+	Oid type = TEXTOID;
+	Datum value;
+	char txid[32];
+	bool journaled;
+
+	snprintf(txid, sizeof(txid), UINT64_FORMAT, row->txid);
+	delivery_begin();
+	value = CStringGetTextDatum(txid);
+	journaled = spi_first_text("SELECT 1 FROM zega.journal WHERE txid = $1::xid8", 1, &type, &value) != NULL;
+	delivery_end();
+	return journaled;
 }
 
 /* Is this row a full zega.import()? */
@@ -1073,6 +1098,13 @@ delivery_round(void)
 	{
 		DeliveryOutcome outcome;
 
+		if (!delivery_journaled(&rows[i]))
+		{
+			delivery_done(&rows[i]);
+			ereport(LOG, (errmsg("pg_zega txid " UINT64_FORMAT " was delivered before; skipped", rows[i].txid)));
+			handled++;
+			continue;
+		}
 		if (delivery_recovering && !delivery_is_import(&rows[i]))
 		{
 			delivery_done(&rows[i]);
