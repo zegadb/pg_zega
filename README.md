@@ -70,7 +70,7 @@ Zega answers 401 until the request carries the bearer:
 curl -fsS -H "Authorization: Bearer $ZEGA_TOKEN" http://127.0.0.1:9342/health
 ```
 
-The first Postgres start creates the extension, preloads it, and sets `zega.password` and `zega.url` from the environment. You do not run `ALTER SYSTEM` for this image. A later start keeps the database and rewrites the password file, so a new `ZEGA_PASSWORD` applies the next time the container starts.
+The first Postgres start creates the extension, preloads it, and sets `zega.password` and `zega.url` from the environment. It also turns on logical decoding (`wal_level = logical`) and starts pg_zega's delivery worker, so [journal mode](#journal-mode) needs no more setup. You do not run `ALTER SYSTEM` for this image. A later start keeps the database and rewrites the password file, so a new `ZEGA_PASSWORD` applies the next time the container starts.
 
 `docker compose -f docker-compose.images.yml down` stops both servers and keeps the volumes. `down -v` deletes the database and the Zega graph.
 
@@ -234,43 +234,45 @@ Engine ids are new after a reload. Edges are linked again from the foreign-key c
 
 ## Journal mode
 
-By default (`zega.mode = precommit`) a commit waits for Zega, and a refusal rolls it back. In journal mode, Postgres commits without calling Zega. Each transaction that changes what Zega holds writes one row to `zega.journal` instead: the schema and the document precommit mode would have sent, and what `zega.import` flushes first. A relay beside Zega delivers those rows in commit order. Postgres does not need `zega.password` in this mode; the relay holds the Zega token.
+By default (`zega.mode = precommit`) a commit waits for Zega, and a refusal rolls it back. In journal mode, Postgres commits without waiting for Zega. Each transaction that changes what Zega holds writes one row to `zega.journal` instead: the schema and the document precommit mode would have sent, and what `zega.import` flushes first. pg_zega's delivery worker, a background process inside Postgres, sends those rows to Zega in commit order. Nothing else runs: Postgres and Zega are the only two containers.
 
-Journal mode needs logical decoding with pg_zega trusted as an output plugin: `wal_level = logical` (which takes a restart) and `output_plugin_libraries = 'pg_zega'` (Postgres 17.x releases that have that setting refuse any plugin it does not name, superusers included). Start the relay once before switching. On its first run it creates the replication slot `zega`, which uses pg_zega's output plugin. It refuses to create the slot while `zega.journal` has rows, because a slot only sees what commits after it exists. Then set the mode for the database. Only a superuser can:
+The `addiscorp/pg_zega` image is ready for it. To switch a database (only a superuser can):
 
 ```sql
 ALTER DATABASE app SET zega.mode = 'journal';
 ```
 
-Run the relay with a role that may use replication slots and delete from `zega.journal`. A superuser can do both.
+New sessions use it. The image's worker runs in the database named by `POSTGRES_DB` (`postgres` by default).
 
-```sh
-cargo build --release --manifest-path relay/Cargo.toml
-relay/target/release/pg_zega-relay \
-  --postgres "host=127.0.0.1 port=5433 user=postgres dbname=app" \
-  --postgres-password-file ./pg-password \
-  --zega http://127.0.0.1:9342 --zega-token-file ./zega-token
+Outside the image, journal mode needs these in `postgresql.conf`, then a restart:
+
+```conf
+shared_preload_libraries = 'pg_zega'
+wal_level = logical
+output_plugin_libraries = 'pg_zega'   # Postgres 17.x releases that have this setting refuse any plugin it does not name
+zega.journal_database = 'app'         # where the worker runs; empty: no worker
+zega.url = 'http://zega:9342'
+zega.password = '<the Zega token>'
 ```
 
-- For each committed row, the relay calls Zega's `POST /deliveries`. The identity is `pg:<system identifier>:<database oid>` and the transaction's `xid8`. Zega applies the schema and the document as one transaction and keeps a receipt with them. Then the relay deletes the row and moves the slot past it.
-- A crash at any point redelivers the same row. Zega answers with the receipt and writes nothing twice.
-- While Zega is down, Postgres keeps committing and the relay retries the same row.
-- If Zega refuses a row (for example a schema change its data cannot take), the relay stops and names the `txid`. The row stays in `zega.journal` and in the slot. Nothing after it is delivered, so the order holds.
-- `zega.import` works in journal mode the same way, with one difference: it does not ask Zega which nodes to remove. Its row names the types to flush (`flush` in `zega.journal`), and Zega removes them when the row is delivered, after every earlier row. A breaking change and its import still commit together and reach Zega as one delivery.
+How it works:
 
-To get past a refused row, bring Zega back in line with Postgres in one step:
+- The worker creates the logical replication slot `zega` (pg_zega's output plugin) when it starts. A slot only sees what commits after it exists, so set the mode once `SELECT slot_name FROM pg_replication_slots` shows it. If `zega.journal` already has rows without a slot, the worker logs a warning and creates none.
+- For each committed row, the worker calls Zega's `POST /deliveries`. The identity is `pg:<system identifier>:<database oid>` and the transaction's `xid8`. Zega applies the flush, the schema and the document as one transaction and keeps a receipt with them. Then the worker deletes the row and moves the slot past it.
+- A crash at any point redelivers the same row. Zega answers with the receipt and writes nothing twice.
+- While Zega is down, Postgres keeps committing and the worker retries the same row (a `LOG` line each time).
+- `zega.import` works the same way, with one difference: it does not ask Zega which nodes to remove. Its row names the types to flush (`flush` in `zega.journal`), and Zega removes them when the row is delivered, after every earlier row. A breaking change and its import still commit together and reach Zega as one delivery.
+- If Zega refuses a row (for example a schema change its data cannot take), the worker logs a `WARNING` with Zega's reason and holds it. Nothing after it is delivered, so the order holds.
+
+To get past a refused row, bring Zega back in line with Postgres:
 
 ```sql
 SELECT zega.import();
 ```
 
-```sh
-relay/target/release/pg_zega-relay ... --recover
-```
+The worker sees the import waiting, drops every row before it (the refused one included), delivers it, and carries on. Nothing is lost: `zega.import` locks the tracked tables against writes (reads still run) until it commits, so every change committed before it is in it. Run it at the default isolation level, read committed.
 
-`--recover` drops every journal row before that import, in commit order, the refused one included. Then it delivers the import, which replaces the whole graph, and carries on as usual. Nothing is lost. `zega.import` locks the tracked tables against writes (reads still run) until it commits, so every change committed before it is in it. Run it at the default isolation level, read committed. Without a full import waiting in `zega.journal`, `--recover` stops and drops nothing.
-
-`--once` delivers everything committed so far, then exits. `test-journal.sh <zega binary> <relay binary>` runs `test.sql` in journal mode and checks that the graph matches precommit mode. It also covers a restart of Zega, a full redelivery from a second slot, `zega.import` (including a breaking change committed with its import), a refused change, and `--recover` past it.
+`test-journal.sh <zega binary>` runs `test.sql` in journal mode and checks that the graph matches precommit mode. It also covers Zega being down, `zega.import` (including a breaking change committed with its import), a refused change, and the recovery past it.
 
 ## Build on GitHub
 

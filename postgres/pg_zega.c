@@ -9,6 +9,12 @@
 #include "miscadmin.h"
 #include "replication/logical.h"
 #include "replication/output_plugin.h"
+#include "pgstat.h"
+#include "postmaster/bgworker.h"
+#include "postmaster/interrupt.h"
+#include "storage/ipc.h"
+#include "storage/latch.h"
+#include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/json.h"
@@ -17,6 +23,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/timestamp.h"
 #include "utils/xid8.h"
 
 #include <curl/curl.h>
@@ -46,6 +53,7 @@ static const struct config_enum_entry zega_mode_options[] = {
 
 static char *zega_url = NULL;
 static char *zega_password = NULL;
+static char *zega_journal_database = NULL;
 static int zega_mode = ZEGA_MODE_PRECOMMIT;
 static StringInfo pending = NULL;
 static int pending_ops = 0;
@@ -163,16 +171,19 @@ auth_headers(struct curl_slist *headers)
 	return next;
 }
 
-static void
-http_request(const char *url, const char *body, const char *method)
+/*
+ * One call to Zega with the bearer token: the transport result, and when it
+ * is CURLE_OK the HTTP status and the start of the response body.
+ */
+static CURLcode
+http_call(const char *url, const char *body, const char *method, long *status, ResponseBuf *response)
 {
 	CURL *curl;
 	struct curl_slist *headers = NULL;
-	ResponseBuf response;
-	long status = 0;
 	CURLcode rc;
 
-	memset(&response, 0, sizeof(response));
+	*status = 0;
+	memset(response, 0, sizeof(*response));
 	headers = auth_headers(NULL);
 	if (body != NULL)
 	{
@@ -200,14 +211,23 @@ http_request(const char *url, const char *body, const char *method)
 		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 	rc = curl_easy_perform(curl);
 	if (rc == CURLE_OK)
-		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, status);
 	curl_slist_free_all(headers);
 	curl_easy_cleanup(curl);
+	return rc;
+}
+
+static void
+http_request(const char *url, const char *body, const char *method)
+{
+	ResponseBuf response;
+	long status;
+	CURLcode rc = http_call(url, body, method, &status, &response);
 
 	if (rc != CURLE_OK)
 		ereport(ERROR,
@@ -581,8 +601,34 @@ _PG_init(void)
 							   NULL,
 							   NULL,
 							   NULL);
+	DefineCustomStringVariable("zega.journal_database",
+							   "Database whose zega.journal pg_zega delivers to Zega (journal mode).",
+							   "Empty: no delivery worker. Needs shared_preload_libraries and wal_level = logical.",
+							   &zega_journal_database,
+							   NULL,
+							   PGC_POSTMASTER,
+							   0,
+							   NULL,
+							   NULL,
+							   NULL);
 	RegisterXactCallback(zega_xact_callback, NULL);
 	curl_global_init(CURL_GLOBAL_ALL);
+
+	if (process_shared_preload_libraries_in_progress
+		&& zega_journal_database != NULL && zega_journal_database[0] != '\0')
+	{
+		BackgroundWorker worker;
+
+		memset(&worker, 0, sizeof(worker));
+		worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+		worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+		worker.bgw_restart_time = 5;
+		snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_zega");
+		snprintf(worker.bgw_function_name, BGW_MAXLEN, "zega_delivery_main");
+		snprintf(worker.bgw_name, BGW_MAXLEN, "pg_zega delivery");
+		snprintf(worker.bgw_type, BGW_MAXLEN, "pg_zega delivery");
+		RegisterBackgroundWorker(&worker);
+	}
 }
 
 typedef struct
@@ -752,9 +798,346 @@ zega_enqueue(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Journal delivery (APS 52): a background worker in the database named by
+ * zega.journal_database. It decodes the journal through the slot "zega"
+ * (pg_zega's output plugin), sends each transaction to Zega's
+ * POST /deliveries under the identity (pg:<system identifier>:<database
+ * oid>, txid), then deletes the row and moves the slot past it. A crash
+ * between the two redelivers the row, and Zega answers with its receipt.
+ *
+ * While Zega cannot be reached (or answers 503) the same row is retried. A
+ * row Zega refuses holds everything after it, so the order holds, until a
+ * full zega.import() is committed: that import holds every change before
+ * it, so the rows before it are dropped and it is delivered.
+ */
+#define DELIVERY_SLOT "zega"
+#define DELIVERY_BATCH 100
+#define DELIVERY_POLL_MS 500L
+#define DELIVERY_RETRY_MAX_MS 5000L
+/* With nothing journaled, how often the slot is moved up to now. */
+#define DELIVERY_IDLE_ADVANCE_MS 30000L
+
+typedef struct
+{
+	char *lsn;
+	char *data;
+	uint64 txid;
+} DeliveryRow;
+
+/* What the last round left: the source identity, and a refused txid. */
+static char *delivery_source = NULL;
+static uint64 delivery_refused = 0;
+/* A full import is waiting behind a refusal: drop rows until it. */
+static bool delivery_recovering = false;
+static long delivery_wait = DELIVERY_POLL_MS;
+static TimestampTz delivery_advanced = 0;
+
+typedef enum
+{
+	DELIVERED,
+	NOT_YET,
+	REFUSED
+} DeliveryOutcome;
+
+static char *
+spi_first_text(const char *query, int nargs, Oid *types, Datum *values)
+{
+	bool isnull;
+
+	if (SPI_execute_with_args(query, nargs, types, values, NULL, false, 1) < 0 || SPI_processed == 0)
+		return NULL;
+	(void) SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
+	if (isnull)
+		return NULL;
+	return SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+}
+
+static void
+delivery_begin(void)
+{
+	StartTransactionCommand();
+	if (SPI_connect() != SPI_OK_CONNECT)
+		ereport(ERROR, (errmsg("pg_zega delivery could not use SPI")));
+	PushActiveSnapshot(GetTransactionSnapshot());
+}
+
+static void
+delivery_end(void)
+{
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+}
+
+/*
+ * The slot exists, or is created now: false while the extension is not
+ * installed, or while the journal holds rows no slot will ever decode.
+ */
+static bool
+delivery_ready(void)
+{
+	char *found;
+
+	if (spi_first_text("SELECT 1 FROM pg_extension WHERE extname = 'pg_zega'", 0, NULL, NULL) == NULL)
+		return false;
+	if (delivery_source == NULL)
+	{
+		char *source = spi_first_text(
+			"SELECT 'pg:' || (SELECT system_identifier FROM pg_control_system()) || ':' "
+			"|| (SELECT oid FROM pg_database WHERE datname = current_database())",
+			0, NULL, NULL);
+
+		if (source == NULL)
+			return false;
+		delivery_source = MemoryContextStrdup(TopMemoryContext, source);
+	}
+	found = spi_first_text("SELECT plugin FROM pg_replication_slots WHERE slot_name = '" DELIVERY_SLOT "'",
+						   0, NULL, NULL);
+	if (found != NULL)
+	{
+		if (strcmp(found, "pg_zega") != 0)
+			ereport(ERROR, (errmsg("pg_zega slot " DELIVERY_SLOT " does not use the pg_zega plugin")));
+		return true;
+	}
+	/* A slot decodes only what commits after it exists. */
+	if (spi_first_text("SELECT 1 FROM zega.journal LIMIT 1", 0, NULL, NULL) != NULL)
+	{
+		ereport(WARNING,
+				(errmsg("pg_zega journal has rows written before slot " DELIVERY_SLOT " existed; they will not be delivered"),
+				 errhint("Run SELECT zega.import() after the slot exists, then delete the older rows.")));
+		return false;
+	}
+	if (SPI_execute("SELECT pg_create_logical_replication_slot('" DELIVERY_SLOT "', 'pg_zega')", false, 0) < 0)
+		ereport(ERROR, (errmsg("pg_zega could not create slot " DELIVERY_SLOT)));
+	ereport(LOG, (errmsg("pg_zega created slot " DELIVERY_SLOT " for journal delivery")));
+	return true;
+}
+
+/* POST one journal line to Zega as a delivery. */
+static DeliveryOutcome
+delivery_send(DeliveryRow *row)
+{
+	StringInfoData body;
+	ResponseBuf response;
+	long status;
+	CURLcode rc;
+	char url[1024];
+	const char *base = zega_url != NULL ? zega_url : "http://host.docker.internal:9342";
+
+	initStringInfo(&body);
+	/* The line is {"txid": ...}: the identity goes first. */
+	appendStringInfo(&body, "{\"source_id\":\"%s\",%s", delivery_source, row->data + 1);
+	snprintf(url, sizeof(url), "%s/deliveries", base);
+	rc = http_call(url, body.data, NULL, &status, &response);
+	pfree(body.data);
+	if (rc != CURLE_OK || status == 503)
+	{
+		ereport(LOG,
+				(errmsg("pg_zega txid " UINT64_FORMAT " not delivered yet (%s); retrying",
+						row->txid, rc != CURLE_OK ? curl_easy_strerror(rc) : "503")));
+		return NOT_YET;
+	}
+	if (status >= 200 && status < 300)
+		return DELIVERED;
+	if (delivery_refused != row->txid)
+		ereport(WARNING,
+				(errmsg("Zega refused txid " UINT64_FORMAT " (%ld): %s", row->txid, status,
+						response.len > 0 ? response.data : "no detail"),
+				 errdetail("Nothing after it is delivered. The row stays in zega.journal."),
+				 errhint("SELECT zega.import() replaces the graph; the rows before it are then dropped.")));
+	delivery_refused = row->txid;
+	return REFUSED;
+}
+
+/* Delete the row and move the slot past it, in one transaction. */
+static void
+delivery_done(DeliveryRow *row)
+{
+	Oid types[2] = {TEXTOID, TEXTOID};
+	Datum values[2];
+	char txid[32];
+
+	snprintf(txid, sizeof(txid), UINT64_FORMAT, row->txid);
+	delivery_begin();
+	values[0] = CStringGetTextDatum(txid);
+	values[1] = CStringGetTextDatum(row->lsn);
+	if (SPI_execute_with_args("DELETE FROM zega.journal WHERE txid = $1::xid8", 1, types, values, NULL, false, 0) < 0
+		|| SPI_execute_with_args("SELECT pg_replication_slot_advance('" DELIVERY_SLOT "', $1::pg_lsn)",
+								 1, types + 1, values + 1, NULL, false, 0) < 0)
+		ereport(ERROR, (errmsg("pg_zega could not mark txid %s delivered", txid)));
+	delivery_end();
+}
+
+/* Is this row a full zega.import()? */
+static bool
+delivery_is_import(DeliveryRow *row)
+{
+	Oid type = TEXTOID;
+	Datum value;
+	char txid[32];
+	bool import;
+
+	snprintf(txid, sizeof(txid), UINT64_FORMAT, row->txid);
+	delivery_begin();
+	value = CStringGetTextDatum(txid);
+	import = spi_first_text("SELECT 1 FROM zega.journal WHERE txid = $1::xid8 AND flush @> '{\"all\": true}'",
+							1, &type, &value) != NULL;
+	delivery_end();
+	return import;
+}
+
+/*
+ * One round: everything committed up to now, in commit order. Returns how
+ * many rows it delivered or dropped; 0 means wait before the next round.
+ */
+static int
+delivery_round(void)
+{
+	DeliveryRow rows[DELIVERY_BATCH];
+	int n = 0;
+	int handled = 0;
+	int i;
+	char *upto;
+	MemoryContext round = AllocSetContextCreate(TopMemoryContext, "pg_zega delivery", ALLOCSET_DEFAULT_SIZES);
+	MemoryContext old;
+
+	delivery_begin();
+	if (!delivery_ready())
+	{
+		delivery_end();
+		MemoryContextDelete(round);
+		return 0;
+	}
+	upto = spi_first_text("SELECT pg_current_wal_flush_lsn()::text", 0, NULL, NULL);
+	/*
+	 * Every row waiting is in zega.journal until it is delivered. With none,
+	 * there is nothing to decode: each decoding logs a few lines, so the slot
+	 * is only moved up now and then, to let go of the WAL behind it.
+	 */
+	if (spi_first_text("SELECT 1 FROM zega.journal LIMIT 1", 0, NULL, NULL) == NULL)
+	{
+		if (TimestampDifferenceExceeds(delivery_advanced, GetCurrentTimestamp(), DELIVERY_IDLE_ADVANCE_MS))
+		{
+			Oid type = TEXTOID;
+			Datum value = CStringGetTextDatum(upto);
+
+			if (SPI_execute_with_args("SELECT pg_replication_slot_advance('" DELIVERY_SLOT "', $1::pg_lsn) "
+									  "FROM pg_replication_slots WHERE slot_name = '" DELIVERY_SLOT "' "
+									  "AND confirmed_flush_lsn < $1::pg_lsn",
+									  1, &type, &value, NULL, false, 0) < 0)
+				ereport(ERROR, (errmsg("pg_zega could not advance slot " DELIVERY_SLOT)));
+			delivery_advanced = GetCurrentTimestamp();
+		}
+		delivery_end();
+		MemoryContextDelete(round);
+		return 0;
+	}
+	{
+		Oid type = TEXTOID;
+		Datum value = CStringGetTextDatum(upto);
+		uint64 k;
+
+		if (SPI_execute_with_args("SELECT lsn::text, data FROM pg_logical_slot_peek_changes('" DELIVERY_SLOT
+								  "', $1::pg_lsn, " CppAsString2(DELIVERY_BATCH) ")",
+								  1, &type, &value, NULL, false, 0) < 0)
+			ereport(ERROR, (errmsg("pg_zega could not read slot " DELIVERY_SLOT)));
+		old = MemoryContextSwitchTo(round);
+		upto = pstrdup(upto);
+		for (k = 0; k < SPI_processed && n < DELIVERY_BATCH; k++)
+		{
+			HeapTuple tuple = SPI_tuptable->vals[k];
+			TupleDesc desc = SPI_tuptable->tupdesc;
+			unsigned long long txid;
+
+			rows[n].lsn = pstrdup(SPI_getvalue(tuple, desc, 1));
+			rows[n].data = pstrdup(SPI_getvalue(tuple, desc, 2));
+			if (sscanf(rows[n].data, "{\"txid\":\"%llu\"", &txid) != 1)
+				ereport(ERROR, (errmsg("pg_zega slot emitted something that is not a journal entry")));
+			rows[n].txid = (uint64) txid;
+			n++;
+		}
+		MemoryContextSwitchTo(old);
+	}
+	/* Held by a refusal: a full import waiting is the way past it. */
+	if (n > 0 && rows[0].txid == delivery_refused && !delivery_recovering)
+		delivery_recovering = spi_first_text("SELECT 1 FROM zega.journal WHERE flush @> '{\"all\": true}' LIMIT 1",
+											 0, NULL, NULL) != NULL;
+	delivery_end();
+
+	if (n > 0 && rows[0].txid == delivery_refused && !delivery_recovering)
+	{
+		MemoryContextDelete(round);
+		return 0;
+	}
+	for (i = 0; i < n; i++)
+	{
+		DeliveryOutcome outcome;
+
+		if (delivery_recovering && !delivery_is_import(&rows[i]))
+		{
+			delivery_done(&rows[i]);
+			ereport(LOG, (errmsg("pg_zega dropped txid " UINT64_FORMAT "; the import after it replaces it", rows[i].txid)));
+			handled++;
+			continue;
+		}
+		outcome = delivery_send(&rows[i]);
+		if (outcome != DELIVERED)
+		{
+			if (outcome == NOT_YET)
+				delivery_wait = Min(delivery_wait * 2, DELIVERY_RETRY_MAX_MS);
+			MemoryContextDelete(round);
+			return handled;
+		}
+		delivery_done(&rows[i]);
+		if (delivery_recovering)
+			ereport(LOG, (errmsg("pg_zega recovered: delivered the import txid " UINT64_FORMAT, rows[i].txid)));
+		delivery_recovering = false;
+		delivery_refused = 0;
+		delivery_wait = DELIVERY_POLL_MS;
+		handled++;
+	}
+	MemoryContextDelete(round);
+	return handled;
+}
+
+PGDLLEXPORT void zega_delivery_main(Datum arg);
+
+void
+zega_delivery_main(Datum arg)
+{
+	(void) arg;
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
+	pqsignal(SIGTERM, die);
+	BackgroundWorkerUnblockSignals();
+	BackgroundWorkerInitializeConnection(zega_journal_database, NULL, 0);
+	pgstat_report_appname("pg_zega delivery");
+	for (;;)
+	{
+		int handled;
+
+		CHECK_FOR_INTERRUPTS();
+		if (ConfigReloadPending)
+		{
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+		pgstat_report_activity(STATE_RUNNING, "delivering zega.journal");
+		handled = delivery_round();
+		pgstat_report_activity(STATE_IDLE, NULL);
+		if (handled == 0)
+		{
+			(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							 delivery_refused != 0 ? DELIVERY_RETRY_MAX_MS : delivery_wait,
+							 PG_WAIT_EXTENSION);
+			ResetLatch(MyLatch);
+		}
+	}
+}
+
+/*
  * The logical decoding output plugin: pg_create_logical_replication_slot(
  * 'zega', 'pg_zega'). Each committed transaction that wrote a zega.journal
- * row is one line of JSON, {"txid", "flush", "schema", "document"}, at the commit's
+ * row is one line of JSON, {"txid", "flush"?, "schema", "document"}, at the commit's
  * LSN, in commit order. Everything else is skipped.
  */
 static void
@@ -839,9 +1222,11 @@ journal_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
 	old = MemoryContextSwitchTo(ctx->context);
 	initStringInfo(&line);
-	appendStringInfo(&line, "{\"txid\":\"" UINT64_FORMAT "\",\"flush\":%s,\"schema\":",
-					 U64FromFullTransactionId(DatumGetFullTransactionId(txid)),
-					 flush != NULL ? flush : "null");
+	appendStringInfo(&line, "{\"txid\":\"" UINT64_FORMAT "\",",
+					 U64FromFullTransactionId(DatumGetFullTransactionId(txid)));
+	if (flush != NULL)
+		appendStringInfo(&line, "\"flush\":%s,", flush);
+	appendStringInfoString(&line, "\"schema\":");
 	if (schema != NULL)
 		escape_json(&line, schema);
 	else
