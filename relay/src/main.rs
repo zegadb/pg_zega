@@ -65,7 +65,12 @@ impl From<postgres::Error> for Stop {
 }
 
 fn main() {
-    let options = match options(std::env::args().skip(1).collect()) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{USAGE}");
+        return;
+    }
+    let options = match options(args) {
         Ok(options) => options,
         Err(message) => {
             eprintln!("{message}\n\n{USAGE}");
@@ -119,7 +124,6 @@ fn options(args: Vec<String>) -> Result<Options, String> {
             }
             "--once" => once = true,
             "--recover" => recover = true,
-            "--help" | "-h" => return Err("pg_zega-relay".into()),
             other => return Err(format!("unknown argument {other}")),
         }
     }
