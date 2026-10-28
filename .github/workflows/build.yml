@@ -38,10 +38,32 @@ jobs:
           done
           docker logs pg-ci; exit 1
 
+  # The relay image on both architectures, built natively; it runs and
+  # prints its usage. The sync job below runs the journal test through it.
+  relay-image:
+    name: Relay image (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --platform ${{ matrix.platform }} -t pg_zega-relay:ci ./relay
+      - name: It runs on ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect pg_zega-relay:ci --format '{{.Os}}/{{.Architecture}}')" = "${{ matrix.platform }}"
+          docker run --rm pg_zega-relay:ci --help 2>&1 | grep -q '^usage: pg_zega-relay'
+
   # Both modes end to end on amd64, against Zega built from the commit in
   # zega-version: test.sql in precommit mode (test.sh), then the same file in
-  # journal mode delivered by the relay (test-journal.sh), which must leave
-  # the same graph.
+  # journal mode delivered by the relay image (test-journal.sh), which must
+  # leave the same graph.
   sync:
     name: Sync tests (precommit and journal)
     runs-on: ubuntu-24.04
@@ -61,12 +83,12 @@ jobs:
         with:
           toolchain: '1.96.0'
       - uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Build Zega and the relay
+      - name: Build Zega and the relay image
         run: |
           set -euo pipefail
           cargo build --locked -p zega-cli --manifest-path zega-src/Cargo.toml
-          cargo build --locked --manifest-path relay/Cargo.toml
           sccache --show-stats
+          docker build -t pg_zega-relay:ci ./relay
       - name: Precommit mode (test.sh)
         run: |
           set -euo pipefail
@@ -77,5 +99,14 @@ jobs:
           echo $! > "$RUNNER_TEMP/zega.pid"
           ./test.sh
           kill "$(cat "$RUNNER_TEMP/zega.pid")"
-      - name: Journal mode (test-journal.sh)
-        run: ./test-journal.sh zega-src/target/debug/zega-server relay/target/debug/pg_zega-relay
+      - name: Journal mode (test-journal.sh), through the relay image
+        run: |
+          set -euo pipefail
+          # The test passes paths under the checkout and reaches Postgres and
+          # Zega on 127.0.0.1: the same paths and the host's network.
+          cat > "$RUNNER_TEMP/relay" <<'SH'
+          #!/bin/sh
+          exec docker run --rm --network host -v "$PWD:$PWD" -w "$PWD" pg_zega-relay:ci "$@"
+          SH
+          chmod +x "$RUNNER_TEMP/relay"
+          ./test-journal.sh zega-src/target/debug/zega-server "$RUNNER_TEMP/relay"

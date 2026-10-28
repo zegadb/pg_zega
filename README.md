@@ -45,6 +45,7 @@ Run both servers from the published images. Neither image contains a password. P
 | Image | Tags | What it is |
 | --- | --- | --- |
 | `addiscorp/pg_zega` | `17`, `0.2`, `latest` | Postgres 17 with pg_zega installed. |
+| `addiscorp/pg_zega-relay` | `0.2`, `latest` | The journal-mode relay (see [Journal mode](#journal-mode)). |
 | `addiscorp/zega` | `0.2.0`, `latest` | Zega 0.2.0, published by [zegadb/zega](https://github.com/zegadb/zega) (`docker/zega`) when a version is promoted. Listens on port 9342. |
 
 `ZEGA_PASSWORD` and `ZEGA_TOKEN` are the same secret. `POSTGRES_PASSWORD` is a different one. The images are linux/amd64.
@@ -243,6 +244,16 @@ ALTER DATABASE app SET zega.mode = 'journal';
 ```
 
 Run the relay with a role that may use replication slots and delete from `zega.journal`. A superuser can do both.
+
+With the published images, the relay is a service beside Zega and Postgres (`addiscorp/pg_zega-relay`, linux/amd64 and linux/arm64). The override turns on logical decoding and starts it:
+
+```sh
+docker compose -f docker-compose.images.yml -f docker-compose.images-journal.yml up -d
+docker compose -f docker-compose.images.yml -f docker-compose.images-journal.yml exec postgres \
+  psql -U postgres -c "ALTER DATABASE postgres SET zega.mode = 'journal'"
+```
+
+Or build it from this repository:
 
 ```sh
 cargo build --release --manifest-path relay/Cargo.toml

@@ -1,0 +1,31 @@
+# Journal mode with the published images (APS 52):
+#   docker compose -f docker-compose.images.yml -f docker-compose.images-journal.yml up -d
+# Postgres decodes its journal for pg_zega's relay, which delivers each
+# commit to Zega in order. Set zega.mode once the relay has started:
+#   ALTER DATABASE postgres SET zega.mode = 'journal';
+services:
+  postgres:
+    command: ["postgres", "-c", "wal_level=logical", "-c", "output_plugin_libraries=pg_zega"]
+  relay:
+    image: ${DOCKERHUB_USERNAME}/pg_zega-relay:0.2
+    command:
+      - --postgres
+      - host=postgres user=postgres dbname=postgres
+      - --postgres-password-file
+      - /run/secrets/postgres_password
+      - --zega
+      - http://zega:9342
+      - --zega-token-file
+      - /run/secrets/zega_token
+    secrets:
+      - postgres_password
+      - zega_token
+    depends_on:
+      - postgres
+      - zega
+    restart: unless-stopped
+secrets:
+  postgres_password:
+    environment: POSTGRES_PASSWORD
+  zega_token:
+    environment: ZEGA_TOKEN

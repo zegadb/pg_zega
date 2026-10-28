@@ -1,6 +1,7 @@
 name: publish
 
-# addiscorp/pg_zega:17, :0.2 and :latest for linux/amd64 and linux/arm64
+# addiscorp/pg_zega:17, :0.2 and :latest, and the journal relay
+# addiscorp/pg_zega-relay:0.2 and :latest, for linux/amd64 and linux/arm64
 # (Apple Silicon Macs run arm64 images; Intel Macs and most Linux run amd64).
 # Each architecture builds natively and is pushed by digest; merge tags both
 # digests together and checks the tag lists exactly those two; readback pulls
@@ -16,11 +17,17 @@ permissions:
 
 jobs:
   build:
-    name: build (${{ matrix.platform }})
+    name: build ${{ matrix.image }} (${{ matrix.platform }})
     strategy:
       fail-fast: true
       matrix:
+        image: [pg_zega, pg_zega-relay]
+        platform: [linux/amd64, linux/arm64]
         include:
+          - image: pg_zega
+            context: ./postgres
+          - image: pg_zega-relay
+            context: ./relay
           - platform: linux/amd64
             runner: ubuntu-24.04
             arch: amd64
@@ -48,19 +55,19 @@ jobs:
         id: push
         uses: docker/build-push-action@v6
         with:
-          context: ./postgres
+          context: ${{ matrix.context }}
           platforms: ${{ matrix.platform }}
-          outputs: type=image,name=${{ vars.DOCKERHUB_USERNAME }}/pg_zega,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
       - name: Record the digest
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           mkdir -p digests
-          printf '%s\n' "$DIGEST" > "digests/${{ matrix.arch }}"
+          printf '%s\n' "$DIGEST" > "digests/${{ matrix.image }}-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: pg-zega-digest-${{ matrix.arch }}
-          path: digests/${{ matrix.arch }}
+          name: digest-${{ matrix.image }}-${{ matrix.arch }}
+          path: digests/${{ matrix.image }}-${{ matrix.arch }}
           retention-days: 1
 
   merge:
@@ -73,7 +80,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: pg-zega-digest-*
+          pattern: digest-*
           path: digests
           merge-multiple: true
       - uses: docker/setup-buildx-action@v3
@@ -81,13 +88,17 @@ jobs:
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
-      - name: Tag both digests as one image
+      - name: Tag both digests of each image as one
         run: |
           set -euo pipefail
-          image="$DOCKERHUB_USERNAME/pg_zega"
-          docker buildx imagetools create \
-            -t "$image:17" -t "$image:0.2" -t "$image:latest" \
-            "$image@$(cat digests/amd64)" "$image@$(cat digests/arm64)"
+          tag() {
+            image="$DOCKERHUB_USERNAME/$1"
+            shift
+            docker buildx imagetools create "$@" \
+              "$image@$(cat "digests/${image##*/}-amd64")" "$image@$(cat "digests/${image##*/}-arm64")"
+          }
+          tag pg_zega -t "$DOCKERHUB_USERNAME/pg_zega:17" -t "$DOCKERHUB_USERNAME/pg_zega:0.2" -t "$DOCKERHUB_USERNAME/pg_zega:latest"
+          tag pg_zega-relay -t "$DOCKERHUB_USERNAME/pg_zega-relay:0.2" -t "$DOCKERHUB_USERNAME/pg_zega-relay:latest"
       # Each build's digest is an index (buildx adds a provenance
       # attestation); the tag lists the platform images inside them. Every
       # tag must list, for each architecture, the platform image its build
@@ -95,10 +106,11 @@ jobs:
       - name: Every tag lists both architectures
         run: |
           set -euo pipefail
-          for tag in 17 0.2 latest; do
-            python3 - "$DOCKERHUB_USERNAME/pg_zega" "$tag" <<'PY'
+          for ref in pg_zega:17 pg_zega:0.2 pg_zega:latest pg_zega-relay:0.2 pg_zega-relay:latest; do
+            python3 - "$DOCKERHUB_USERNAME/${ref%%:*}" "${ref#*:}" <<'PY'
           import json, subprocess, sys
           image, tag = sys.argv[1:3]
+          name = image.split("/")[-1]
           def raw(ref):
               return json.loads(subprocess.run(["docker", "buildx", "imagetools", "inspect", ref, "--raw"],
                                                check=True, capture_output=True, text=True).stdout)
@@ -107,7 +119,7 @@ jobs:
                       for m in index.get("manifests", []) if m.get("platform", {}).get("os") not in (None, "unknown")}
           want = {}
           for arch in ("amd64", "arm64"):
-              pushed = open(f"digests/{arch}").read().strip()
+              pushed = open(f"digests/{name}-{arch}").read().strip()
               inner = platforms(raw(f"{image}@{pushed}"))
               want[f"linux/{arch}"] = inner.get(f"linux/{arch}", pushed)
           served = platforms(raw(f"{image}:{tag}"))
@@ -146,3 +158,10 @@ jobs:
             sleep 2
           done
           docker logs pg-readback; exit 1
+      - name: Pull the relay tag and run it
+        run: |
+          set -euo pipefail
+          image="$DOCKERHUB_USERNAME/pg_zega-relay:0.2"
+          docker pull "$image"
+          test "$(docker image inspect "$image" --format '{{.Os}}/{{.Architecture}}')" = "${{ matrix.platform }}"
+          docker run --rm "$image" --help 2>&1 | grep -q '^usage: pg_zega-relay'
