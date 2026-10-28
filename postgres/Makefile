@@ -1,6 +1,6 @@
 MODULES = pg_zega
 EXTENSION = pg_zega
-DATA = pg_zega--0.1.sql
+DATA = pg_zega--0.1.sql pg_zega--0.2.sql pg_zega--0.1--0.2.sql
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
