@@ -1,6 +1,6 @@
 name: publish
 
-# addiscorp/pg_zega:17, :0.1 and :latest for linux/amd64 and linux/arm64
+# addiscorp/pg_zega:17, :0.2 and :latest for linux/amd64 and linux/arm64
 # (Apple Silicon Macs run arm64 images; Intel Macs and most Linux run amd64).
 # Each architecture builds natively and is pushed by digest; merge tags both
 # digests together and checks the tag lists exactly those two; readback pulls
@@ -86,7 +86,7 @@ jobs:
           set -euo pipefail
           image="$DOCKERHUB_USERNAME/pg_zega"
           docker buildx imagetools create \
-            -t "$image:17" -t "$image:0.1" -t "$image:latest" \
+            -t "$image:17" -t "$image:0.2" -t "$image:latest" \
             "$image@$(cat digests/amd64)" "$image@$(cat digests/arm64)"
       # Each build's digest is an index (buildx adds a provenance
       # attestation); the tag lists the platform images inside them. Every
@@ -95,7 +95,7 @@ jobs:
       - name: Every tag lists both architectures
         run: |
           set -euo pipefail
-          for tag in 17 0.1 latest; do
+          for tag in 17 0.2 latest; do
             python3 - "$DOCKERHUB_USERNAME/pg_zega" "$tag" <<'PY'
           import json, subprocess, sys
           image, tag = sys.argv[1:3]
@@ -136,7 +136,7 @@ jobs:
       - name: Pull the tag and start it with pg_zega loaded
         run: |
           set -euo pipefail
-          image="$DOCKERHUB_USERNAME/pg_zega:0.1"
+          image="$DOCKERHUB_USERNAME/pg_zega:0.2"
           docker pull "$image"
           test "$(docker image inspect "$image" --format '{{.Os}}/{{.Architecture}}')" = "${{ matrix.platform }}"
           docker run -d --name pg-readback -e POSTGRES_PASSWORD=readback -e ZEGA_PASSWORD=readback "$image"

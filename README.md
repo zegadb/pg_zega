@@ -44,7 +44,7 @@ Run both servers from the published images. Neither image contains a password. P
 
 | Image | Tags | What it is |
 | --- | --- | --- |
-| `addiscorp/pg_zega` | `17`, `0.1`, `latest` | Postgres 17 with pg_zega installed. |
+| `addiscorp/pg_zega` | `17`, `0.2`, `latest` | Postgres 17 with pg_zega installed. |
 | `addiscorp/zega` | `0.2.0`, `latest` | Zega 0.2.0, published by [zegadb/zega](https://github.com/zegadb/zega) (`docker/zega`) when a version is promoted. Listens on port 9342. |
 
 `ZEGA_PASSWORD` and `ZEGA_TOKEN` are the same secret. `POSTGRES_PASSWORD` is a different one. The images are linux/amd64.
@@ -230,9 +230,37 @@ An untracked name raises `pg_zega table ... is not tracked`. With nothing tracke
 
 Engine ids are new after a reload. Edges are linked again from the foreign-key columns, so the old ids are not reused.
 
+## Journal mode
+
+By default (`zega.mode = precommit`) a commit waits for Zega, and a refusal rolls it back. In journal mode, Postgres commits without calling Zega. Each transaction that changes what Zega holds writes one row to `zega.journal` instead: the schema and the document precommit mode would have sent. A relay beside Zega delivers those rows in commit order. Postgres does not need `zega.password` in this mode; the relay holds the Zega token.
+
+Journal mode needs logical decoding with pg_zega trusted as an output plugin: `wal_level = logical` (which takes a restart) and `output_plugin_libraries = 'pg_zega'` (Postgres 17.x releases that have that setting refuse any plugin it does not name, superusers included). Start the relay once before switching. On its first run it creates the replication slot `zega`, which uses pg_zega's output plugin. It refuses to create the slot while `zega.journal` has rows, because a slot only sees what commits after it exists. Then set the mode for the database. Only a superuser can:
+
+```sql
+ALTER DATABASE app SET zega.mode = 'journal';
+```
+
+Run the relay with a role that may use replication slots and delete from `zega.journal`. A superuser can do both.
+
+```sh
+cargo build --release --manifest-path relay/Cargo.toml
+relay/target/release/pg_zega-relay \
+  --postgres "host=127.0.0.1 port=5433 user=postgres dbname=app" \
+  --postgres-password-file ./pg-password \
+  --zega http://127.0.0.1:9342 --zega-token-file ./zega-token
+```
+
+- For each committed row, the relay calls Zega's `POST /deliveries`. The identity is `pg:<system identifier>:<database oid>` and the transaction's `xid8`. Zega applies the schema and the document as one transaction and keeps a receipt with them. Then the relay deletes the row and moves the slot past it.
+- A crash at any point redelivers the same row. Zega answers with the receipt and writes nothing twice.
+- While Zega is down, Postgres keeps committing and the relay retries the same row.
+- If Zega refuses a row (for example a schema change its data cannot take), the relay stops and names the `txid`. The row stays in `zega.journal` and in the slot. Nothing after it is delivered, so the order holds.
+- `zega.import` is not available in journal mode yet. Set `zega.mode` to `precommit` for the import, then back.
+
+`--once` delivers everything committed so far, then exits. `test-journal.sh <zega binary> <relay binary>` runs `test.sql` in journal mode and checks that the graph matches precommit mode. It also covers a restart of Zega, a full redelivery from a second slot, and a refused change.
+
 ## Build on GitHub
 
-Postgres extensions are distributed as source and compiled with [PGXS](https://www.postgresql.org/docs/current/extend-pgxs.html) on the server that loads them. `make` and `make install` write `pg_zega.so` into that server's library directory and the control file plus `pg_zega--0.1.sql` into its extension directory. A library built for another major version, another OS, or another libc will not load there.
+Postgres extensions are distributed as source and compiled with [PGXS](https://www.postgresql.org/docs/current/extend-pgxs.html) on the server that loads them. `make` and `make install` write `pg_zega.so` into that server's library directory and the control file plus the `pg_zega--*.sql` scripts into its extension directory. A library built for another major version, another OS, or another libc will not load there.
 
 This repository is that source. [PGXN](https://pgxn.org/) and distro packages (one package per Postgres major, the way PGDG ships extension debs) are later ways to hand the same source to `pgxn install` or `apt`. Both still compile, or they publish one binary per major version and per distribution.
 

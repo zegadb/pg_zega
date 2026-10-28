@@ -1,12 +1,22 @@
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/xact.h"
+#include "catalog/pg_type.h"
+#include "executor/spi.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "replication/logical.h"
+#include "replication/output_plugin.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/json.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
+#include "utils/xid8.h"
 
 #include <curl/curl.h>
 #include <stdlib.h>
@@ -14,8 +24,28 @@
 
 PG_MODULE_MAGIC;
 
+/*
+ * zega.mode: how a commit reaches Zega.
+ * precommit: sent before Postgres commits; a refusal rolls the transaction back.
+ * journal: written to zega.journal in the transaction itself; pg_zega's
+ * logical decoding output plugin hands it, in commit order, to a relay that
+ * delivers it to Zega (APS 52).
+ */
+enum
+{
+	ZEGA_MODE_PRECOMMIT,
+	ZEGA_MODE_JOURNAL
+};
+
+static const struct config_enum_entry zega_mode_options[] = {
+	{"precommit", ZEGA_MODE_PRECOMMIT, false},
+	{"journal", ZEGA_MODE_JOURNAL, false},
+	{NULL, 0, false}
+};
+
 static char *zega_url = NULL;
 static char *zega_password = NULL;
+static int zega_mode = ZEGA_MODE_PRECOMMIT;
 static StringInfo pending = NULL;
 static int pending_ops = 0;
 
@@ -247,6 +277,28 @@ flush_id(const char *chunk)
 	return id;
 }
 
+/* Journal mode: this transaction's schema and document become one row. */
+static void
+journal_insert(const char *schema, const char *document)
+{
+	Oid types[2] = {TEXTOID, TEXTOID};
+	Datum values[2];
+	int rc;
+
+	values[0] = CStringGetTextDatum(schema);
+	values[1] = CStringGetTextDatum(document);
+	PushActiveSnapshot(GetTransactionSnapshot());
+	if (SPI_connect() != SPI_OK_CONNECT)
+		ereport(ERROR, (errmsg("pg_zega could not write the journal")));
+	rc = SPI_execute_with_args(
+		"INSERT INTO zega.journal (txid, schema, document) VALUES (pg_current_xact_id(), $1, $2)",
+		2, types, values, NULL, false, 0);
+	if (rc != SPI_OK_INSERT)
+		ereport(ERROR, (errmsg("pg_zega could not write the journal (%d)", rc)));
+	SPI_finish();
+	PopActiveSnapshot();
+}
+
 static void
 post_apply(void)
 {
@@ -314,6 +366,21 @@ post_apply(void)
 		chunk = sep + 1;
 	}
 
+	/*
+	 * A flush names engine ids read from Zega now; a journal entry is applied
+	 * later, when those ids may mean nothing.
+	 */
+	if (zega_mode == ZEGA_MODE_JOURNAL && (reset || node_n > 0 || rel_n > 0))
+	{
+		free(copy);
+		free(mutations);
+		free(node_ids);
+		free(rel_ids);
+		ereport(ERROR,
+				(errmsg("pg_zega import is not available in journal mode"),
+				 errhint("Set zega.mode to precommit for the import.")));
+	}
+
 	if (reset)
 	{
 		snprintf(url, sizeof(url), "%s/graph", base);
@@ -366,6 +433,20 @@ post_apply(void)
 		strcat(document, mutations);
 	}
 	free(mutations);
+	if (zega_mode == ZEGA_MODE_JOURNAL)
+	{
+		PG_TRY();
+		{
+			journal_insert(schema_text, document);
+		}
+		PG_FINALLY();
+		{
+			free(schema_text);
+			free(document);
+		}
+		PG_END_TRY();
+		return;
+	}
 	escaped = json_escape_dup(document);
 	free(document);
 	if (escaped == NULL)
@@ -419,6 +500,17 @@ _PG_init(void)
 							   NULL,
 							   NULL,
 							   NULL);
+	DefineCustomEnumVariable("zega.mode",
+							 "How a commit reaches Zega: precommit or journal.",
+							 NULL,
+							 &zega_mode,
+							 ZEGA_MODE_PRECOMMIT,
+							 zega_mode_options,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 	DefineCustomStringVariable("zega.password",
 							   "Bearer token sent to Zega on every sync call.",
 							   NULL,
@@ -584,7 +676,8 @@ zega_enqueue(PG_FUNCTION_ARGS)
 	char *chunk;
 	MemoryContext old;
 
-	require_password();
+	if (zega_mode == ZEGA_MODE_PRECOMMIT)
+		require_password();
 	chunk = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	old = MemoryContextSwitchTo(TopMemoryContext);
 	if (pending == NULL)
@@ -596,4 +689,107 @@ zega_enqueue(PG_FUNCTION_ARGS)
 	MemoryContextSwitchTo(old);
 	pfree(chunk);
 	PG_RETURN_VOID();
+}
+
+/*
+ * The logical decoding output plugin: pg_create_logical_replication_slot(
+ * 'zega', 'pg_zega'). Each committed transaction that wrote a zega.journal
+ * row is one line of JSON, {"txid", "schema", "document"}, at the commit's
+ * LSN, in commit order. Everything else is skipped.
+ */
+static void
+journal_startup(LogicalDecodingContext *ctx, OutputPluginOptions *options, bool is_init)
+{
+	(void) ctx;
+	(void) is_init;
+	options->output_type = OUTPUT_PLUGIN_TEXTUAL_OUTPUT;
+}
+
+static void
+journal_begin(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
+{
+	(void) ctx;
+	txn->output_plugin_private = NULL;
+}
+
+static char *
+journal_text(HeapTuple tuple, TupleDesc desc, const char *column)
+{
+	int attnum = SPI_fnumber(desc, column);
+	bool isnull;
+	Datum value;
+
+	if (attnum <= 0)
+		ereport(ERROR, (errmsg("pg_zega journal has no column %s", column)));
+	value = heap_getattr(tuple, attnum, desc, &isnull);
+	return isnull ? NULL : TextDatumGetCString(value);
+}
+
+static void
+journal_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
+			   Relation relation, ReorderBufferChange *change)
+{
+	TupleDesc desc = RelationGetDescr(relation);
+	HeapTuple tuple;
+	MemoryContext old;
+	StringInfoData line;
+	char *schema;
+	char *document;
+	bool isnull;
+	Datum txid;
+	char *namespace;
+
+	if (change->action != REORDER_BUFFER_CHANGE_INSERT)
+		return;
+	if (strcmp(RelationGetRelationName(relation), "journal") != 0)
+		return;
+	namespace = get_namespace_name(RelationGetNamespace(relation));
+	if (namespace == NULL || strcmp(namespace, "zega") != 0)
+		return;
+	tuple = change->data.tp.newtuple;
+	if (tuple == NULL)
+		return;
+	txid = heap_getattr(tuple, SPI_fnumber(desc, "txid"), desc, &isnull);
+	if (isnull)
+		ereport(ERROR, (errmsg("pg_zega journal row has no txid")));
+	schema = journal_text(tuple, desc, "schema");
+	document = journal_text(tuple, desc, "document");
+	if (schema == NULL || document == NULL)
+		ereport(ERROR, (errmsg("pg_zega journal row is incomplete")));
+
+	old = MemoryContextSwitchTo(ctx->context);
+	initStringInfo(&line);
+	appendStringInfo(&line, "{\"txid\":\"" UINT64_FORMAT "\",\"schema\":",
+					 U64FromFullTransactionId(DatumGetFullTransactionId(txid)));
+	escape_json(&line, schema);
+	appendStringInfoString(&line, ",\"document\":");
+	escape_json(&line, document);
+	appendStringInfoChar(&line, '}');
+	MemoryContextSwitchTo(old);
+	/* One row per transaction: zega.journal's key is the txid. */
+	txn->output_plugin_private = line.data;
+}
+
+static void
+journal_commit(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, XLogRecPtr commit_lsn)
+{
+	char *line = (char *) txn->output_plugin_private;
+
+	(void) commit_lsn;
+	if (line == NULL)
+		return;
+	OutputPluginPrepareWrite(ctx, true);
+	appendStringInfoString(ctx->out, line);
+	OutputPluginWrite(ctx, true);
+	pfree(line);
+	txn->output_plugin_private = NULL;
+}
+
+void
+_PG_output_plugin_init(OutputPluginCallbacks *cb)
+{
+	cb->startup_cb = journal_startup;
+	cb->begin_cb = journal_begin;
+	cb->change_cb = journal_change;
+	cb->commit_cb = journal_commit;
 }

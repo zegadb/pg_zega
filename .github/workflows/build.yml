@@ -37,3 +37,45 @@ jobs:
             sleep 2
           done
           docker logs pg-ci; exit 1
+
+  # Both modes end to end on amd64, against Zega built from the commit in
+  # zega-version: test.sql in precommit mode (test.sh), then the same file in
+  # journal mode delivered by the relay (test-journal.sh), which must leave
+  # the same graph.
+  sync:
+    name: Sync tests (precommit and journal)
+    runs-on: ubuntu-24.04
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: 'true'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out Zega at zega-version
+        run: |
+          set -euo pipefail
+          git init -q zega-src
+          git -C zega-src fetch -q --depth 1 https://github.com/zegadb/zega "$(cat zega-version)"
+          git -C zega-src checkout -q FETCH_HEAD
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: '1.96.0'
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Build Zega and the relay
+        run: |
+          set -euo pipefail
+          cargo build --locked -p zega-cli --manifest-path zega-src/Cargo.toml
+          cargo build --locked --manifest-path relay/Cargo.toml
+          sccache --show-stats
+      - name: Precommit mode (test.sh)
+        run: |
+          set -euo pipefail
+          printf 'pg_zega-test-token\n' > "$RUNNER_TEMP/token"
+          # The container reaches the host through host-gateway, not loopback.
+          zega-src/target/debug/zega-server start --data "$RUNNER_TEMP/zega" --host 0.0.0.0 --port 9342 \
+            --token-file "$RUNNER_TEMP/token" > "$RUNNER_TEMP/zega.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/zega.pid"
+          ./test.sh
+          kill "$(cat "$RUNNER_TEMP/zega.pid")"
+      - name: Journal mode (test-journal.sh)
+        run: ./test-journal.sh zega-src/target/debug/zega-server relay/target/debug/pg_zega-relay

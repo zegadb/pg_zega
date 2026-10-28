@@ -1,0 +1,5 @@
+# Journal mode needs logical decoding with pg_zega trusted as an output plugin:
+#   docker compose -f docker-compose.yml -f docker-compose.journal.yml
+services:
+  postgres:
+    command: ["postgres", "-c", "wal_level=logical", "-c", "output_plugin_libraries=pg_zega"]
