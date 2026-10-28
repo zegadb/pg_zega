@@ -15,7 +15,6 @@ serve.sh
 pg-password
 zega-token
 
-# Relay build output
+# Build output
 .target/
 .tmp/
-relay/target/

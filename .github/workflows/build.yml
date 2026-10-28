@@ -40,8 +40,8 @@ jobs:
 
   # Both modes end to end on amd64, against Zega built from the commit in
   # zega-version: test.sql in precommit mode (test.sh), then the same file in
-  # journal mode delivered by the relay (test-journal.sh), which must leave
-  # the same graph.
+  # journal mode delivered by pg_zega's delivery worker (test-journal.sh),
+  # which must leave the same graph.
   sync:
     name: Sync tests (precommit and journal)
     runs-on: ubuntu-24.04
@@ -61,11 +61,10 @@ jobs:
         with:
           toolchain: '1.96.0'
       - uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Build Zega and the relay
+      - name: Build Zega
         run: |
           set -euo pipefail
           cargo build --locked -p zega-cli --manifest-path zega-src/Cargo.toml
-          cargo build --locked --manifest-path relay/Cargo.toml
           sccache --show-stats
       - name: Precommit mode (test.sh)
         run: |
@@ -78,4 +77,4 @@ jobs:
           ./test.sh
           kill "$(cat "$RUNNER_TEMP/zega.pid")"
       - name: Journal mode (test-journal.sh)
-        run: ./test-journal.sh zega-src/target/debug/zega-server relay/target/debug/pg_zega-relay
+        run: ./test-journal.sh zega-src/target/debug/zega-server

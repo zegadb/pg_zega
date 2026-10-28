@@ -1,13 +1,13 @@
 #!/bin/sh
-# Journal mode end to end: test.sql in zega.mode = journal, delivered by the
-# relay, must leave the same graph as precommit mode (check-graph.py).
-#   ./test-journal.sh <zega binary> <pg_zega-relay binary>
-# Starts its own Zega on 127.0.0.1:9342 and rebuilds this compose project;
+# Journal mode end to end: test.sql in zega.mode = journal, delivered by
+# pg_zega's delivery worker, must leave the same graph as precommit mode
+# (check-graph.py).
+#   ./test-journal.sh <zega binary>
+# Starts its own Zega on port 9342 and rebuilds this compose project;
 # `docker compose down -v` drops the database volume.
 set -eu
 cd "$(dirname "$0")"
 zega_bin=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
-relay_bin=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
 
 work=.tmp/journal
 mkdir -p .tmp
@@ -20,12 +20,12 @@ if [ -z "${POSTGRES_PASSWORD:-}" ]; then
     POSTGRES_PASSWORD=$(openssl rand -hex 24)
     export POSTGRES_PASSWORD
 fi
-printf '%s\n' "$POSTGRES_PASSWORD" > "$work/pg-password"
-compose="docker compose -f docker-compose.yml -f docker-compose.journal.yml"
+compose="docker compose"
 zega_pid=
 
 start_zega() {
-    "$zega_bin" start --data "$work/zega" --port 9342 --token-file "$work/token" >> "$work/zega.log" 2>&1 &
+    # The container reaches the host through host-gateway, not loopback.
+    "$zega_bin" start --data "$work/zega" --host 0.0.0.0 --port 9342 --token-file "$work/token" >> "$work/zega.log" 2>&1 &
     zega_pid=$!
     i=0
     until curl -sf -H "Authorization: Bearer $ZEGA_PASSWORD" http://127.0.0.1:9342/health >/dev/null; do
@@ -34,32 +34,38 @@ start_zega() {
         sleep 1
     done
 }
-stop_zega() {
-    kill "$zega_pid"
-    wait "$zega_pid" 2>/dev/null || true
-    zega_pid=
-}
 cleanup() {
-    if [ -n "$zega_pid" ]; then stop_zega; fi
+    if [ -n "$zega_pid" ]; then kill "$zega_pid"; wait "$zega_pid" 2>/dev/null || true; fi
 }
 trap cleanup EXIT
 
 psql() {
     $compose exec -T postgres psql -U postgres -v ON_ERROR_STOP=1 -tA "$@"
 }
-relay() {
-    "$relay_bin" --postgres "host=127.0.0.1 port=${PG_ZEGA_TEST_PORT:-5433} user=postgres dbname=postgres" \
-        --postgres-password-file "$work/pg-password" \
-        --zega http://127.0.0.1:9342 --zega-token-file "$work/token" --once "$@"
-}
-nodes() {
-    curl -sf -H "Accept: application/json" -H "Authorization: Bearer $ZEGA_PASSWORD" http://127.0.0.1:9342/graph |
-        python3 -c 'import json,sys; print(len(json.load(sys.stdin)["result"]["nodes"]))'
+waiting() {
+    psql -c "SELECT count(*) FROM zega.journal"
 }
 fail() { echo "FAIL: $*" >&2; exit 1; }
+# The worker empties zega.journal: wait for it.
+delivered() {
+    i=0
+    until [ "$(waiting)" = 0 ]; do
+        i=$((i + 1))
+        if [ "$i" -gt 60 ]; then $compose logs --tail 40 postgres >&2; fail "$1"; fi
+        sleep 0.5
+    done
+}
+worker_log() {
+    $compose logs postgres 2>&1
+}
+graph() {
+    curl -sf -H "Accept: application/json" -H "Authorization: Bearer $ZEGA_PASSWORD" http://127.0.0.1:9342/graph
+}
+nodes() {
+    graph | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["result"]["nodes"]))'
+}
 
-echo "starting zega and postgres (wal_level=logical)"
-start_zega
+echo "starting postgres; Zega stays down for now"
 $compose down -v >/dev/null 2>&1 || true
 $compose up --build -d
 i=0
@@ -69,46 +75,46 @@ until $compose exec -T postgres pg_isready -U postgres >/dev/null 2>&1 && psql -
     sleep 2
 done
 
-echo "the relay creates its slot; a second slot will replay everything"
-relay
-psql -c "SELECT pg_create_logical_replication_slot('zega_replay', 'pg_zega')" >/dev/null
+echo "the delivery worker runs and creates its slot"
+i=0
+until [ "$(psql -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'zega' AND plugin = 'pg_zega'")" = 1 ]; do
+    i=$((i + 1))
+    if [ "$i" -gt 60 ]; then $compose logs --tail 80; fail "the worker created no slot"; fi
+    sleep 0.5
+done
+[ "$(psql -c "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'pg_zega delivery'")" = 1 ] ||
+    fail "no pg_zega delivery worker"
 psql -c "ALTER DATABASE postgres SET zega.mode = 'journal'" >/dev/null
 
-echo "test.sql commits without Zega seeing anything"
+echo "with Zega down, test.sql commits and is journaled"
 psql < test.sql >/dev/null
-[ "$(nodes)" = 0 ] || fail "Zega changed before the relay ran"
-waiting=$(psql -c "SELECT count(*) FROM zega.journal")
-[ "$waiting" -gt 0 ] || fail "nothing was journaled"
-echo "journaled $waiting transactions"
+journaled=$(waiting)
+[ "$journaled" -gt 0 ] || fail "nothing was journaled"
+echo "journaled $journaled transactions"
 
-echo "the relay delivers them in commit order: the same graph as precommit"
-relay
-python3 check-graph.py >/dev/null || fail "the delivered graph differs from precommit's"
-[ "$(psql -c "SELECT count(*) FROM zega.journal")" = 0 ] || fail "delivered rows are still in zega.journal"
+i=0
+until worker_log | grep -q "not delivered yet"; do
+    i=$((i + 1))
+    if [ "$i" -gt 60 ]; then worker_log | grep -E "pg_zega|ERROR|exited" >&2; fail "the worker never tried Zega"; fi
+    sleep 0.5
+done
 
-echo "with Zega down, Postgres still commits; the relay waits and delivers"
-before=$(nodes)
-stop_zega
-psql -c "INSERT INTO users (user_id, name) VALUES (12, 'Kat')" >/dev/null
-relay > "$work/relay-wait.log" 2>&1 &
-relay_pid=$!
-sleep 3
+echo "Zega comes up; the worker delivers them in commit order: the same graph as precommit"
 start_zega
-wait "$relay_pid" || { cat "$work/relay-wait.log" >&2; fail "the relay did not deliver after Zega came back"; }
-grep -q "retrying" "$work/relay-wait.log" || fail "the relay never had to wait"
+delivered "the worker did not deliver after Zega came up"
+python3 check-graph.py >/dev/null || fail "the delivered graph differs from precommit's"
+
+echo "a commit reaches Zega without anyone running anything"
+before=$(nodes)
+psql -c "INSERT INTO users (user_id, name) VALUES (12, 'Kat')" >/dev/null
+delivered "Kat was not delivered"
 [ "$(nodes)" = $((before + 1)) ] || fail "Kat was not delivered exactly once"
-
-echo "a second slot redelivers every transaction: nothing is applied twice"
 after=$(nodes)
-relay --slot zega_replay
-[ "$(nodes)" = "$after" ] || fail "a redelivery wrote again"
-python3 check-graph.py >/dev/null || fail "a redelivery changed the graph"
 
-echo "zega.import journals what to flush by type; Zega flushes it on delivery"
+echo "zega.import flushes by type when it is delivered"
 psql -c "SELECT zega.import()" >/dev/null
 psql -c "SELECT zega.import('users')" >/dev/null
-[ "$(psql -c "SELECT count(*) FROM zega.journal WHERE flush IS NOT NULL")" = 2 ] || fail "the imports journaled no flush"
-relay
+delivered "an import was not delivered"
 python3 check-graph.py >/dev/null || fail "an import changed the graph"
 [ "$(nodes)" = "$after" ] || fail "an import lost or duplicated nodes"
 
@@ -119,24 +125,23 @@ ALTER TABLE people ADD COLUMN code text NOT NULL DEFAULT 'x';
 SELECT zega.import('people');
 COMMIT;
 SQL
-relay
-curl -sf -H "Accept: application/json" -H "Authorization: Bearer $ZEGA_PASSWORD" http://127.0.0.1:9342/graph |
-    python3 -c 'import json,sys; people=[n for n in json.load(sys.stdin)["result"]["nodes"] if n.get("labels")==["people"]]; assert [p.get("code") for p in people]==["x"], people' ||
+delivered "the breaking change was not delivered"
+graph | python3 -c 'import json,sys; people=[n for n in json.load(sys.stdin)["result"]["nodes"] if n.get("labels")==["people"]]; assert [p.get("code") for p in people]==["x"], people' ||
     fail "people were not reloaded with the new column"
 
-echo "a change Zega refuses stops the relay and stays journaled"
+echo "a change Zega refuses holds the journal"
 psql -c "ALTER TABLE people ADD COLUMN badge text NOT NULL DEFAULT 'y'" >/dev/null
-if relay > "$work/relay-refused.log" 2>&1; then fail "the relay accepted a refused delivery"; fi
-grep -q "refused txid" "$work/relay-refused.log" || { cat "$work/relay-refused.log" >&2; fail "no refusal reported"; }
-[ "$(psql -c "SELECT count(*) FROM zega.journal")" = 1 ] || fail "the refused row left zega.journal"
-
-echo "--recover without a full import drops nothing"
-if relay --recover > "$work/recover-none.log" 2>&1; then fail "--recover ran without an import"; fi
-grep -q "run SELECT zega.import()" "$work/recover-none.log" || { cat "$work/recover-none.log" >&2; fail "wrong --recover error"; }
-[ "$(psql -c "SELECT count(*) FROM zega.journal")" = 1 ] || fail "--recover dropped rows without an import"
-
-echo "rows after the refused one wait; an import waits for open writes"
+i=0
+until worker_log | grep -q "Zega refused txid"; do
+    i=$((i + 1))
+    if [ "$i" -gt 60 ]; then fail "no refusal logged"; fi
+    sleep 0.5
+done
 psql -c "INSERT INTO users (user_id, name) VALUES (13, 'Lin')" >/dev/null
+sleep 3
+[ "$(waiting)" = 2 ] || fail "rows after the refused one were not held"
+
+echo "an import waits for open writes"
 psql -c "BEGIN; INSERT INTO users (user_id, name) VALUES (14, 'Mo'); SELECT pg_sleep(4); COMMIT;" >/dev/null &
 writer=$!
 sleep 1
@@ -148,12 +153,11 @@ sleep 1
 wait "$writer" || fail "the open write failed"
 wait "$importer" || fail "the import failed"
 
-echo "--recover drops the rows before the import and delivers it"
-relay --recover > "$work/recover.log" 2>&1 || { cat "$work/recover.log" >&2; fail "--recover failed"; }
-grep -q "dropped txid" "$work/recover.log" || fail "--recover dropped nothing"
-[ "$(psql -c "SELECT count(*) FROM zega.journal")" = 0 ] || fail "rows are left in zega.journal"
-curl -sf -H "Accept: application/json" -H "Authorization: Bearer $ZEGA_PASSWORD" http://127.0.0.1:9342/graph |
-    python3 -c '
+echo "the worker drops the rows before the import and delivers it"
+delivered "the worker did not recover with the import"
+worker_log | grep -q "dropped txid" || fail "the worker dropped nothing"
+worker_log | grep -q "recovered: delivered the import" || fail "the worker did not report the recovery"
+graph | python3 -c '
 import json, sys
 nodes = json.load(sys.stdin)["result"]["nodes"]
 people = [n for n in nodes if n.get("labels") == ["people"]]
@@ -163,8 +167,7 @@ assert users == [10, 11, 12, 13, 14], users
 ' || fail "the recovered graph is not what Postgres holds"
 python3 check-graph.py >/dev/null || fail "the recovered graph lost the test.sql rows"
 psql -c "INSERT INTO users (user_id, name) VALUES (15, 'Pia')" >/dev/null
-relay
-[ "$(psql -c "SELECT count(*) FROM zega.journal")" = 0 ] || fail "the relay did not carry on after --recover"
+delivered "the worker did not carry on after the recovery"
 
 $compose down -v >/dev/null 2>&1
 echo "pg_zega journal test passed"

@@ -34,10 +34,18 @@ if [ "$#" -eq 0 ] || [ "$1" = "postgres" ]; then
     umask 077
     pass="${ZEGA_PASSWORD//\'/\'\'}"
     quoted_url="${url//\'/\'\'}"
+    database="${POSTGRES_DB:-${POSTGRES_USER:-postgres}}"
+    quoted_database="${database//\'/\'\'}"
+    # Journal mode (zega.mode = journal) is ready without more setup: logical
+    # decoding with pg_zega as its output plugin, and pg_zega's delivery
+    # worker in this database.
     cat > /etc/pg-zega/zega.conf <<EOF
 shared_preload_libraries = 'pg_zega'
 zega.password = '${pass}'
 zega.url = '${quoted_url}'
+wal_level = logical
+output_plugin_libraries = 'pg_zega'
+zega.journal_database = '${quoted_database}'
 EOF
     chmod 0644 /etc/pg-zega/zega.conf
 
