@@ -44,7 +44,7 @@ Run both servers from the published images. Neither image contains a password. P
 
 | Image | Tags | What it is |
 | --- | --- | --- |
-| `addiscorp/pg_zega` | `17`, `0.2`, `latest` | Postgres 17 with pg_zega installed. |
+| `addiscorp/pg_zega` | `17`, `0.3`, `latest` | Postgres 17 with pg_zega installed. |
 | `addiscorp/zega` | `0.2.0`, `latest` | Zega 0.2.0, published by [zegadb/zega](https://github.com/zegadb/zega) (`docker/zega`) when a version is promoted. Listens on port 9342. |
 
 `ZEGA_PASSWORD` and `ZEGA_TOKEN` are the same secret. `POSTGRES_PASSWORD` is a different one. The images are linux/amd64.
@@ -271,6 +271,15 @@ SELECT zega.import();
 ```
 
 The worker sees the import waiting, drops every row before it (the refused one included), delivers it, and carries on. Nothing is lost: `zega.import` locks the tracked tables against writes (reads still run) until it commits, so every change committed before it is in it. Run it at the default isolation level, read committed.
+
+To see how far Zega is behind:
+
+```sql
+SELECT * FROM zega.delivery_status;
+--  worker_running | waiting | oldest_waiting | lag | retained_wal_bytes
+```
+
+`waiting` rows are committed but not yet in Zega, the oldest since `oldest_waiting` (`lag` ago). `retained_wal_bytes` is the WAL that slot `zega` keeps Postgres from recycling; it grows while Zega is down or a row is refused, so alert on it and on `lag`. The view is new in pg_zega 0.3; a database on an older version gets it with `ALTER EXTENSION pg_zega UPDATE`.
 
 `test-journal.sh <zega binary>` runs `test.sql` in journal mode and checks that the graph matches precommit mode. It also covers Zega being down, `zega.import` (including a breaking change committed with its import), a refused change, and the recovery past it.
 
