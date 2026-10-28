@@ -41,3 +41,9 @@ echo "running sync test"
 docker compose exec -T postgres psql -U postgres -v ON_ERROR_STOP=1 < test.sql
 
 python3 check-graph.py
+
+echo "zega.import replaces the graph with the same rows"
+docker compose exec -T postgres psql -U postgres -v ON_ERROR_STOP=1 -c "SELECT zega.import()" >/dev/null
+docker compose exec -T postgres psql -U postgres -v ON_ERROR_STOP=1 -c "SELECT zega.import('users')" >/dev/null
+python3 check-graph.py >/dev/null
+echo "pg_zega import test passed"

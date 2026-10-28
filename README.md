@@ -228,6 +228,8 @@ Three scopes:
 
 An untracked name raises `pg_zega table ... is not tracked`. With nothing tracked, `zega.import()` raises `pg_zega has nothing tracked to import`.
 
+While it runs, `zega.import` locks every tracked table against writes (`SHARE` mode); reads go on. Writes wait for its commit, so a change is either in the import or comes after it, in Zega too.
+
 Engine ids are new after a reload. Edges are linked again from the foreign-key columns, so the old ids are not reused.
 
 ## Journal mode
@@ -256,7 +258,19 @@ relay/target/release/pg_zega-relay \
 - If Zega refuses a row (for example a schema change its data cannot take), the relay stops and names the `txid`. The row stays in `zega.journal` and in the slot. Nothing after it is delivered, so the order holds.
 - `zega.import` works in journal mode the same way, with one difference: it does not ask Zega which nodes to remove. Its row names the types to flush (`flush` in `zega.journal`), and Zega removes them when the row is delivered, after every earlier row. A breaking change and its import still commit together and reach Zega as one delivery.
 
-`--once` delivers everything committed so far, then exits. `test-journal.sh <zega binary> <relay binary>` runs `test.sql` in journal mode and checks that the graph matches precommit mode. It also covers a restart of Zega, a full redelivery from a second slot, `zega.import` (including a breaking change committed with its import), and a refused change.
+To get past a refused row, bring Zega back in line with Postgres in one step:
+
+```sql
+SELECT zega.import();
+```
+
+```sh
+relay/target/release/pg_zega-relay ... --recover
+```
+
+`--recover` drops every journal row before that import, in commit order, the refused one included. Then it delivers the import, which replaces the whole graph, and carries on as usual. Nothing is lost. `zega.import` locks the tracked tables against writes (reads still run) until it commits, so every change committed before it is in it. Run it at the default isolation level, read committed. Without a full import waiting in `zega.journal`, `--recover` stops and drops nothing.
+
+`--once` delivers everything committed so far, then exits. `test-journal.sh <zega binary> <relay binary>` runs `test.sql` in journal mode and checks that the graph matches precommit mode. It also covers a restart of Zega, a full redelivery from a second slot, `zega.import` (including a breaking change committed with its import), a refused change, and `--recover` past it.
 
 ## Build on GitHub
 

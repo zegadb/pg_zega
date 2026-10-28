@@ -79,6 +79,14 @@ DECLARE
     edges oid[] := ARRAY[]::oid[];
 BEGIN
     PERFORM zega.prepare_reload();
+    -- No tracked table may change while the import reads it, and each read
+    -- below takes a new snapshot after these locks: whatever committed before
+    -- this import is in it, and whatever commits after it follows it, in
+    -- Zega too. Run it at the default isolation, read committed.
+    FOR relid IN SELECT t.relid FROM zega.tracked t ORDER BY t.relid
+    LOOP
+        EXECUTE format('LOCK TABLE %s IN SHARE MODE', relid::regclass);
+    END LOOP;
     IF target IS NULL THEN
         IF NOT EXISTS (SELECT 1 FROM zega.tracked) THEN
             RAISE EXCEPTION 'pg_zega has nothing tracked to import';
