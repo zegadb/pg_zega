@@ -814,6 +814,8 @@ zega_enqueue(PG_FUNCTION_ARGS)
 #define DELIVERY_BATCH 100
 #define DELIVERY_POLL_MS 500L
 #define DELIVERY_RETRY_MAX_MS 5000L
+/* The most journal text one POST /deliveries/batch carries (Zega takes 16 MB). */
+#define DELIVERY_BATCH_BYTES (8 * 1024 * 1024)
 /* With nothing journaled, how often the slot is moved up to now. */
 #define DELIVERY_IDLE_ADVANCE_MS 30000L
 
@@ -822,6 +824,12 @@ typedef struct
 	char *lsn;
 	char *data;
 	uint64 txid;
+	/* Still in zega.journal, so not delivered before (delivery_mark). */
+	bool journaled;
+	/* A full zega.import(): flush {"all": true}. */
+	bool import;
+	/* Delivered or dropped this round: deleted at its end. */
+	bool done;
 } DeliveryRow;
 
 /* What the last round left: the source identity, and a refused txid. */
@@ -831,6 +839,8 @@ static uint64 delivery_refused = 0;
 static bool delivery_recovering = false;
 static long delivery_wait = DELIVERY_POLL_MS;
 static TimestampTz delivery_advanced = 0;
+/* Zega answered 404 to a batch: it predates POST /deliveries/batch. */
+static bool delivery_one_by_one = false;
 
 typedef enum
 {
@@ -915,7 +925,7 @@ delivery_ready(void)
 
 /* POST one journal line to Zega as a delivery. */
 static DeliveryOutcome
-delivery_send(DeliveryRow *row)
+delivery_send(DeliveryRow *row, bool forget_earlier)
 {
 	StringInfoData body;
 	ResponseBuf response;
@@ -925,12 +935,9 @@ delivery_send(DeliveryRow *row)
 	const char *base = zega_url != NULL ? zega_url : "http://host.docker.internal:9342";
 
 	initStringInfo(&body);
-	/*
-	 * The line is {"txid": ...}: the identity goes first. Every earlier row
-	 * is out of zega.journal, so it is never sent again (delivery_journaled):
-	 * Zega can forget its receipts.
-	 */
-	appendStringInfo(&body, "{\"source_id\":\"%s\",\"forget_earlier\":true,%s", delivery_source, row->data + 1);
+	/* The line is {"txid": ...}: the identity goes first. */
+	appendStringInfo(&body, "{\"source_id\":\"%s\",%s%s", delivery_source,
+					 forget_earlier ? "\"forget_earlier\":true," : "", row->data + 1);
 	snprintf(url, sizeof(url), "%s/deliveries", base);
 	rc = http_call(url, body.data, NULL, &status, &response);
 	pfree(body.data);
@@ -953,62 +960,134 @@ delivery_send(DeliveryRow *row)
 	return REFUSED;
 }
 
-/* Delete the row and move the slot past it, in one transaction. */
-static void
-delivery_done(DeliveryRow *row)
+/*
+ * POST rows[0..n) that are still journaled as one batch: Zega applies them
+ * in one transaction, with one commit. forget_earlier goes on the first,
+ * and keeps the whole batch's receipts.
+ */
+static DeliveryOutcome
+delivery_send_batch(DeliveryRow *rows, int n)
 {
-	Oid types[2] = {TEXTOID, TEXTOID};
-	Datum values[2];
-	char txid[32];
+	StringInfoData body;
+	ResponseBuf response;
+	long status;
+	CURLcode rc;
+	char url[1024];
+	const char *base = zega_url != NULL ? zega_url : "http://host.docker.internal:9342";
+	bool first = true;
+	int i;
 
-	snprintf(txid, sizeof(txid), UINT64_FORMAT, row->txid);
-	delivery_begin();
-	values[0] = CStringGetTextDatum(txid);
-	values[1] = CStringGetTextDatum(row->lsn);
-	if (SPI_execute_with_args("DELETE FROM zega.journal WHERE txid = $1::xid8", 1, types, values, NULL, false, 0) < 0
-		|| SPI_execute_with_args("SELECT pg_replication_slot_advance('" DELIVERY_SLOT "', $1::pg_lsn)",
-								 1, types + 1, values + 1, NULL, false, 0) < 0)
-		ereport(ERROR, (errmsg("pg_zega could not mark txid %s delivered", txid)));
-	delivery_end();
+	initStringInfo(&body);
+	appendStringInfo(&body, "{\"source_id\":\"%s\",\"deliveries\":[", delivery_source);
+	for (i = 0; i < n; i++)
+	{
+		if (!rows[i].journaled)
+			continue;
+		/* Each line is {"txid": ...}. */
+		appendStringInfo(&body, "%s{%s%s", first ? "" : ",", first ? "\"forget_earlier\":true," : "", rows[i].data + 1);
+		first = false;
+	}
+	appendStringInfoString(&body, "]}");
+	snprintf(url, sizeof(url), "%s/deliveries/batch", base);
+	rc = http_call(url, body.data, NULL, &status, &response);
+	pfree(body.data);
+	if (rc != CURLE_OK || status == 503)
+	{
+		ereport(LOG,
+				(errmsg("pg_zega txid " UINT64_FORMAT " and after not delivered yet (%s); retrying",
+						rows[0].txid, rc != CURLE_OK ? curl_easy_strerror(rc) : "503")));
+		return NOT_YET;
+	}
+	if (status >= 200 && status < 300)
+		return DELIVERED;
+	if (status == 404)
+	{
+		ereport(LOG, (errmsg("pg_zega: Zega has no POST /deliveries/batch; delivering one row at a time")));
+		delivery_one_by_one = true;
+	}
+	/* Refused: the round goes again one row at a time, to find which. */
+	return REFUSED;
+}
+
+/* The round's txids as an xid8[] literal: {1,2,3}. */
+static Datum
+delivery_txids(DeliveryRow *rows, int n, bool only_done)
+{
+	StringInfoData list;
+	bool first = true;
+	int i;
+
+	initStringInfo(&list);
+	appendStringInfoChar(&list, '{');
+	for (i = 0; i < n; i++)
+	{
+		if (only_done && !rows[i].done)
+			continue;
+		appendStringInfo(&list, "%s" UINT64_FORMAT, first ? "" : ",", rows[i].txid);
+		first = false;
+	}
+	appendStringInfoChar(&list, '}');
+	return CStringGetTextDatum(list.data);
 }
 
 /*
- * Is this row still in zega.journal? A row delivered before is not: the slot
- * is moved past each row when it is deleted, but that move reaches the disk
- * only at a checkpoint, so after a crash the slot decodes those rows again.
+ * Which of the round's rows are still in zega.journal, and which are full
+ * imports, in one query. A row delivered before is not in it: the slot is
+ * moved past rows at the end of each round, but that move reaches the disk
+ * only at a checkpoint, so after a crash the slot decodes them again.
  */
-static bool
-delivery_journaled(DeliveryRow *row)
+static void
+delivery_mark(DeliveryRow *rows, int n)
 {
 	Oid type = TEXTOID;
-	Datum value;
-	char txid[32];
-	bool journaled;
+	Datum value = delivery_txids(rows, n, false);
+	uint64 k;
+	int i;
 
-	snprintf(txid, sizeof(txid), UINT64_FORMAT, row->txid);
-	delivery_begin();
-	value = CStringGetTextDatum(txid);
-	journaled = spi_first_text("SELECT 1 FROM zega.journal WHERE txid = $1::xid8", 1, &type, &value) != NULL;
-	delivery_end();
-	return journaled;
+	if (SPI_execute_with_args("SELECT txid::text, coalesce(flush @> '{\"all\": true}', false) FROM zega.journal "
+							  "WHERE txid = ANY ($1::xid8[])",
+							  1, &type, &value, NULL, true, 0) < 0)
+		ereport(ERROR, (errmsg("pg_zega could not read zega.journal")));
+	for (k = 0; k < SPI_processed; k++)
+	{
+		HeapTuple tuple = SPI_tuptable->vals[k];
+		uint64 txid = strtou64(SPI_getvalue(tuple, SPI_tuptable->tupdesc, 1), NULL, 10);
+		bool isnull;
+		bool import = DatumGetBool(SPI_getbinval(tuple, SPI_tuptable->tupdesc, 2, &isnull));
+
+		for (i = 0; i < n; i++)
+			if (rows[i].txid == txid)
+			{
+				rows[i].journaled = true;
+				rows[i].import = import;
+			}
+	}
 }
 
-/* Is this row a full zega.import()? */
-static bool
-delivery_is_import(DeliveryRow *row)
+/*
+ * End a round: delete its delivered and dropped rows and move the slot past
+ * everything it handled, in one transaction. Until the delete commits those
+ * rows are still journaled, so a crash sends them again, and Zega answers
+ * from their receipts: forget_earlier goes only on a round's first delivery,
+ * when every earlier round's rows are gone.
+ */
+static void
+delivery_finish(DeliveryRow *rows, int handled)
 {
-	Oid type = TEXTOID;
-	Datum value;
-	char txid[32];
-	bool import;
+	Oid types[1] = {TEXTOID};
+	Datum done;
+	Datum lsn;
 
-	snprintf(txid, sizeof(txid), UINT64_FORMAT, row->txid);
+	if (handled == 0)
+		return;
 	delivery_begin();
-	value = CStringGetTextDatum(txid);
-	import = spi_first_text("SELECT 1 FROM zega.journal WHERE txid = $1::xid8 AND flush @> '{\"all\": true}'",
-							1, &type, &value) != NULL;
+	done = delivery_txids(rows, handled, true);
+	lsn = CStringGetTextDatum(rows[handled - 1].lsn);
+	if (SPI_execute_with_args("DELETE FROM zega.journal WHERE txid = ANY ($1::xid8[])", 1, types, &done, NULL, false, 0) < 0
+		|| SPI_execute_with_args("SELECT pg_replication_slot_advance('" DELIVERY_SLOT "', $1::pg_lsn)",
+								 1, types, &lsn, NULL, false, 0) < 0)
+		ereport(ERROR, (errmsg("pg_zega could not mark the delivered rows")));
 	delivery_end();
-	return import;
 }
 
 /*
@@ -1022,6 +1101,7 @@ delivery_round(void)
 	int n = 0;
 	int handled = 0;
 	int i;
+	bool sent = false;
 	char *upto;
 	MemoryContext round = AllocSetContextCreate(TopMemoryContext, "pg_zega delivery", ALLOCSET_DEFAULT_SIZES);
 	MemoryContext old;
@@ -1079,8 +1159,11 @@ delivery_round(void)
 			if (sscanf(rows[n].data, "{\"txid\":\"%llu\"", &txid) != 1)
 				ereport(ERROR, (errmsg("pg_zega slot emitted something that is not a journal entry")));
 			rows[n].txid = (uint64) txid;
+			rows[n].journaled = rows[n].import = rows[n].done = false;
 			n++;
 		}
+		if (n > 0)
+			delivery_mark(rows, n);
 		MemoryContextSwitchTo(old);
 	}
 	/* Held by a refusal: a full import waiting is the way past it. */
@@ -1094,33 +1177,67 @@ delivery_round(void)
 		MemoryContextDelete(round);
 		return 0;
 	}
+	/*
+	 * The round's journaled rows as one batch, as many as fit in
+	 * DELIVERY_BATCH_BYTES; the rest wait for the next round. A refusal, a
+	 * recovery or an older Zega takes the row by row loop below.
+	 */
+	if (!delivery_recovering && !delivery_one_by_one && n > 1)
+	{
+		int cut = 0;
+		size_t bytes = 0;
+		DeliveryOutcome outcome;
+
+		while (cut < n && (cut == 0 || bytes + strlen(rows[cut].data) <= DELIVERY_BATCH_BYTES))
+			bytes += strlen(rows[cut++].data);
+		outcome = delivery_send_batch(rows, cut);
+		if (outcome == NOT_YET)
+		{
+			delivery_wait = Min(delivery_wait * 2, DELIVERY_RETRY_MAX_MS);
+			MemoryContextDelete(round);
+			return 0;
+		}
+		if (outcome == DELIVERED)
+		{
+			for (i = 0; i < cut; i++)
+			{
+				rows[i].done = rows[i].journaled;
+				if (!rows[i].journaled)
+					ereport(LOG, (errmsg("pg_zega txid " UINT64_FORMAT " was delivered before; skipped", rows[i].txid)));
+			}
+			delivery_refused = 0;
+			delivery_wait = DELIVERY_POLL_MS;
+			delivery_finish(rows, cut);
+			MemoryContextDelete(round);
+			return cut;
+		}
+	}
 	for (i = 0; i < n; i++)
 	{
 		DeliveryOutcome outcome;
 
-		if (!delivery_journaled(&rows[i]))
+		if (!rows[i].journaled)
 		{
-			delivery_done(&rows[i]);
 			ereport(LOG, (errmsg("pg_zega txid " UINT64_FORMAT " was delivered before; skipped", rows[i].txid)));
 			handled++;
 			continue;
 		}
-		if (delivery_recovering && !delivery_is_import(&rows[i]))
+		if (delivery_recovering && !rows[i].import)
 		{
-			delivery_done(&rows[i]);
+			rows[i].done = true;
 			ereport(LOG, (errmsg("pg_zega dropped txid " UINT64_FORMAT "; the import after it replaces it", rows[i].txid)));
 			handled++;
 			continue;
 		}
-		outcome = delivery_send(&rows[i]);
+		outcome = delivery_send(&rows[i], !sent);
 		if (outcome != DELIVERED)
 		{
 			if (outcome == NOT_YET)
 				delivery_wait = Min(delivery_wait * 2, DELIVERY_RETRY_MAX_MS);
-			MemoryContextDelete(round);
-			return handled;
+			break;
 		}
-		delivery_done(&rows[i]);
+		sent = true;
+		rows[i].done = true;
 		if (delivery_recovering)
 			ereport(LOG, (errmsg("pg_zega recovered: delivered the import txid " UINT64_FORMAT, rows[i].txid)));
 		delivery_recovering = false;
@@ -1128,6 +1245,7 @@ delivery_round(void)
 		delivery_wait = DELIVERY_POLL_MS;
 		handled++;
 	}
+	delivery_finish(rows, handled);
 	MemoryContextDelete(round);
 	return handled;
 }
