@@ -38,43 +38,37 @@ jobs:
           done
           docker logs pg-ci; exit 1
 
-  # Both modes end to end on amd64, against Zega built from the commit in
-  # zega-version: test.sql in precommit mode (test.sh), then the same file in
+  # Both modes end to end on amd64, against the published Zega release named
+  # in zega-version (vX.Y.Z, or vX.Y.Z-canary-<sha> to test an unreleased
+  # change): test.sql in precommit mode (test.sh), then the same file in
   # journal mode delivered by pg_zega's delivery worker (test-journal.sh),
   # which must leave the same graph.
   sync:
     name: Sync tests (precommit and journal)
     runs-on: ubuntu-24.04
-    env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: 'true'
-      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
-      - name: Check out Zega at zega-version
+      - name: Download Zega at zega-version
         run: |
           set -euo pipefail
-          git init -q zega-src
-          git -C zega-src fetch -q --depth 1 https://github.com/zegadb/zega "$(cat zega-version)"
-          git -C zega-src checkout -q FETCH_HEAD
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
-        with:
-          toolchain: '1.96.0'
-      - uses: mozilla-actions/sccache-action@v0.0.9
-      - name: Build Zega
-        run: |
-          set -euo pipefail
-          cargo build --locked -p zega-cli --manifest-path zega-src/Cargo.toml
-          sccache --show-stats
+          tag=$(cat zega-version)
+          base="https://releases.zega.dev/$tag"
+          mkdir -p zega-bin
+          curl -fsSL "$base/manifest.json" -o zega-bin/manifest.json
+          curl -fsSL "$base/zega-server-linux-x64" -o zega-bin/zega-server
+          want=$(jq -er '.artifacts["zega-server-linux-x64"]' zega-bin/manifest.json)
+          echo "$want  zega-bin/zega-server" | sha256sum -c -
+          chmod +x zega-bin/zega-server
+          zega-bin/zega-server --version
       - name: Precommit mode (test.sh)
         run: |
           set -euo pipefail
           printf 'pg_zega-test-token\n' > "$RUNNER_TEMP/token"
           # The container reaches the host through host-gateway, not loopback.
-          zega-src/target/debug/zega-server start --data "$RUNNER_TEMP/zega" --host 0.0.0.0 --port 9342 \
+          zega-bin/zega-server start --data "$RUNNER_TEMP/zega" --host 0.0.0.0 --port 9342 \
             --token-file "$RUNNER_TEMP/token" > "$RUNNER_TEMP/zega.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/zega.pid"
           ./test.sh
           kill "$(cat "$RUNNER_TEMP/zega.pid")"
       - name: Journal mode (test-journal.sh)
-        run: ./test-journal.sh zega-src/target/debug/zega-server
+        run: ./test-journal.sh zega-bin/zega-server
