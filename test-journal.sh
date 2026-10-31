@@ -3,10 +3,16 @@
 # pg_zega's delivery worker, must leave the same graph as precommit mode
 # (check-graph.py).
 #   ./test-journal.sh <zega binary>
-# Starts its own Zega on port 9342 and rebuilds this compose project;
+# Starts its own Zega on port $ZEGA_TEST_PORT (9342) and rebuilds this compose project;
 # `docker compose down -v` drops the database volume.
 set -eu
 cd "$(dirname "$0")"
+
+# Zega's port on this machine: 9342 unless ZEGA_TEST_PORT says otherwise (CI gives each job its own).
+ZEGA_TEST_PORT=${ZEGA_TEST_PORT:-9342}
+export ZEGA_TEST_PORT
+ZEGA_URL=${ZEGA_URL:-http://host.docker.internal:$ZEGA_TEST_PORT}
+export ZEGA_URL
 zega_bin=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 
 work=.tmp/journal
@@ -25,10 +31,10 @@ zega_pid=
 
 start_zega() {
     # The container reaches the host through host-gateway, not loopback.
-    "$zega_bin" start --data "$work/zega" --host 0.0.0.0 --port 9342 --token-file "$work/token" >> "$work/zega.log" 2>&1 &
+    "$zega_bin" start --data "$work/zega" --host 0.0.0.0 --port "$ZEGA_TEST_PORT" --token-file "$work/token" >> "$work/zega.log" 2>&1 &
     zega_pid=$!
     i=0
-    until curl -sf -H "Authorization: Bearer $ZEGA_PASSWORD" http://127.0.0.1:9342/health >/dev/null; do
+    until curl -sf -H "Authorization: Bearer $ZEGA_PASSWORD" http://127.0.0.1:$ZEGA_TEST_PORT/health >/dev/null; do
         i=$((i + 1))
         if [ "$i" -gt 60 ]; then echo "zega did not start" >&2; cat "$work/zega.log" >&2; exit 1; fi
         sleep 1
@@ -59,7 +65,7 @@ worker_log() {
     $compose logs postgres 2>&1
 }
 graph() {
-    curl -sf -H "Accept: application/json" -H "Authorization: Bearer $ZEGA_PASSWORD" http://127.0.0.1:9342/graph
+    curl -sf -H "Accept: application/json" -H "Authorization: Bearer $ZEGA_PASSWORD" http://127.0.0.1:$ZEGA_TEST_PORT/graph
 }
 nodes() {
     graph | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["result"]["nodes"]))'

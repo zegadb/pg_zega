@@ -1,7 +1,7 @@
-"""The graph test.sql leaves in Zega, in either zega.mode. Zega at 127.0.0.1:9342."""
-import json, urllib.request
+"""The graph test.sql leaves in Zega, in either zega.mode. Zega at 127.0.0.1:$ZEGA_TEST_PORT (9342)."""
+import json, os, urllib.request
 graph = json.load(urllib.request.urlopen(
-    urllib.request.Request("http://127.0.0.1:9342/graph", headers={"Accept": "application/json", "Authorization": "Bearer pg_zega-test-token"})
+    urllib.request.Request(f"http://127.0.0.1:{os.environ.get('ZEGA_TEST_PORT', '9342')}/graph", headers={"Accept": "application/json", "Authorization": "Bearer pg_zega-test-token"})
 ))
 nodes = graph["result"]["nodes"]
 rels = graph["result"]["rels"]

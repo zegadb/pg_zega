@@ -63,6 +63,16 @@ jobs:
       COMPOSE_PROJECT_NAME: pg-zega-sync-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
+      - name: Free ports for this job's Zega and Postgres
+        run: |
+          python3 - >> "$GITHUB_ENV" <<'PY'
+          import socket
+          ports = []
+          for _ in range(2):
+              s = socket.socket(); s.bind(("127.0.0.1", 0)); ports.append(s)
+          print(f"ZEGA_TEST_PORT={ports[0].getsockname()[1]}")
+          print(f"PG_ZEGA_TEST_PORT={ports[1].getsockname()[1]}")
+          PY
       - name: Download Zega at zega-version
         run: |
           set -euo pipefail
@@ -80,7 +90,7 @@ jobs:
           set -euo pipefail
           printf 'pg_zega-test-token\n' > "$RUNNER_TEMP/token"
           # The container reaches the host through host-gateway, not loopback.
-          zega-bin/zega-server start --data "$RUNNER_TEMP/zega" --host 0.0.0.0 --port 9342 \
+          zega-bin/zega-server start --data "$RUNNER_TEMP/zega" --host 0.0.0.0 --port "$ZEGA_TEST_PORT" \
             --token-file "$RUNNER_TEMP/token" > "$RUNNER_TEMP/zega.log" 2>&1 &
           echo $! > "$RUNNER_TEMP/zega.pid"
           ./test.sh
