@@ -190,7 +190,14 @@ refusals=$(worker_log | grep -c "Zega refused" || true)
 kill "$zega_pid"; wait "$zega_pid" 2>/dev/null || true; zega_pid=
 psql -c "INSERT INTO users (user_id, name) VALUES (17, 'Ray')" >/dev/null
 $compose kill -s SIGKILL postgres >/dev/null 2>&1
-$compose start postgres >/dev/null 2>&1
+# Crash recovery on a busy machine can take a while; a restart that fails says why.
+$compose start postgres >/dev/null || fail "postgres did not restart after the crash"
+i=0
+until $compose exec -T postgres pg_isready -U postgres >/dev/null 2>&1 && psql -c "SELECT 1" >/dev/null 2>&1; do
+    i=$((i + 1))
+    if [ "$i" -gt 120 ]; then $compose logs --tail 80 postgres >&2; fail "postgres did not recover from the crash"; fi
+    sleep 0.5
+done
 start_zega
 delivered "the worker did not carry on after the crash"
 [ "$(worker_log | grep -c "Zega refused" || true)" = "$refusals" ] || fail "Zega refused a row after the crash"
