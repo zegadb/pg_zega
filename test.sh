@@ -1,9 +1,15 @@
 #!/bin/sh
-# Rebuilds this compose project and deletes the graph at http://127.0.0.1:9342.
-# `docker compose down -v` drops the database volume. Start Zega on port 9342 first, with
+# Rebuilds this compose project and deletes the graph at http://127.0.0.1:$ZEGA_TEST_PORT (9342).
+# `docker compose down -v` drops the database volume. Start Zega on that port first, with
 # ZEGA_TOKEN=pg_zega-test-token (the token test.sql uses).
 set -eu
 cd "$(dirname "$0")"
+
+# Zega's port on this machine: 9342 unless ZEGA_TEST_PORT says otherwise (CI gives each job its own).
+ZEGA_TEST_PORT=${ZEGA_TEST_PORT:-9342}
+export ZEGA_TEST_PORT
+ZEGA_URL=${ZEGA_URL:-http://host.docker.internal:$ZEGA_TEST_PORT}
+export ZEGA_URL
 
 ZEGA_PASSWORD=pg_zega-test-token
 export ZEGA_PASSWORD
@@ -21,7 +27,7 @@ echo "waiting for postgres and the host zega"
 ready=0
 i=0
 while [ "$i" -lt 60 ]; do
-    if curl -sf -H "Authorization: Bearer $ZEGA_PASSWORD" http://127.0.0.1:9342/health >/dev/null && \
+    if curl -sf -H "Authorization: Bearer $ZEGA_PASSWORD" http://127.0.0.1:$ZEGA_TEST_PORT/health >/dev/null && \
        docker compose exec -T postgres pg_isready -U postgres >/dev/null; then
         ready=1
         break
@@ -30,12 +36,12 @@ while [ "$i" -lt 60 ]; do
     sleep 2
 done
 if [ "$ready" -ne 1 ]; then
-    echo "postgres or zega did not become ready. Start Zega on 127.0.0.1:9342" >&2
+    echo "postgres or zega did not become ready. Start Zega on 127.0.0.1:$ZEGA_TEST_PORT" >&2
     docker compose logs --tail 80
     exit 1
 fi
 
-curl -sf -H "Authorization: Bearer $ZEGA_PASSWORD" -X DELETE http://127.0.0.1:9342/graph >/dev/null
+curl -sf -H "Authorization: Bearer $ZEGA_PASSWORD" -X DELETE http://127.0.0.1:$ZEGA_TEST_PORT/graph >/dev/null
 
 echo "running sync test"
 docker compose exec -T postgres psql -U postgres -v ON_ERROR_STOP=1 < test.sql
