@@ -25,21 +25,30 @@ jobs:
           - platform: linux/arm64
             runner: host-macos-arm64
     runs-on: ${{ matrix.runner }}
+    env:
+      # The host runners share one Docker daemon: tag and container are this job's own.
+      IMAGE: pg_zega-ci:${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+      CONTAINER: pg-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
     steps:
       - uses: actions/checkout@v4
       - name: Compile and install on Postgres 17
-        run: docker build --platform ${{ matrix.platform }} -t pg_zega:ci ./postgres
+        run: docker build --platform ${{ matrix.platform }} -t "$IMAGE" ./postgres
       - name: It starts with pg_zega loaded on ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          test "$(docker image inspect pg_zega:ci --format '{{.Os}}/{{.Architecture}}')" = "${{ matrix.platform }}"
-          docker run -d --name pg-ci -e POSTGRES_PASSWORD=ci-password -e ZEGA_PASSWORD=ci-zega pg_zega:ci
+          test "$(docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}')" = "${{ matrix.platform }}"
+          docker run -d --name "$CONTAINER" -e POSTGRES_PASSWORD=ci-password -e ZEGA_PASSWORD=ci-zega "$IMAGE"
           for _ in $(seq 1 60); do
-            version="$(docker exec pg-ci psql -U postgres -tAc "SELECT extversion FROM pg_extension WHERE extname = 'pg_zega'" 2>/dev/null || true)"
+            version="$(docker exec "$CONTAINER" psql -U postgres -tAc "SELECT extversion FROM pg_extension WHERE extname = 'pg_zega'" 2>/dev/null || true)"
             if [ -n "$version" ]; then echo "pg_zega $version loaded on ${{ matrix.platform }}"; exit 0; fi
             sleep 2
           done
-          docker logs pg-ci; exit 1
+          docker logs "$CONTAINER"; exit 1
+      - name: Remove this job's container and image
+        if: always()
+        run: |
+          docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+          docker image rm "$IMAGE" >/dev/null 2>&1 || true
 
   # Both modes end to end on amd64, against the published Zega release named
   # in zega-version (vX.Y.Z, or vX.Y.Z-canary-<sha> to test an unreleased
@@ -49,6 +58,9 @@ jobs:
   sync:
     name: Sync tests (precommit and journal)
     runs-on: host-linux-x64 # temporary, as above
+    env:
+      # The host runners share one Docker daemon: this job's compose project is its own.
+      COMPOSE_PROJECT_NAME: pg-zega-sync-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
       - name: Download Zega at zega-version
