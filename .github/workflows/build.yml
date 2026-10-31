@@ -17,10 +17,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # host-* runners are temporary (Sami, 31 Oct: no hosted minutes until
+          # 1 Nov); arm64 builds natively in [simien]'s Docker until a mirab VM
+          # has Docker (mirab#59).
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: host-linux-x64
           - platform: linux/arm64
-            runner: ubuntu-24.04-arm
+            runner: host-macos-arm64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +48,7 @@ jobs:
   # which must leave the same graph.
   sync:
     name: Sync tests (precommit and journal)
-    runs-on: ubuntu-24.04
+    runs-on: host-linux-x64 # temporary, as above
     steps:
       - uses: actions/checkout@v4
       - name: Download Zega at zega-version
