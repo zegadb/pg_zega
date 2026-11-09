@@ -296,4 +296,4 @@ The GitHub Actions workflow builds `postgres/Dockerfile` on every push and pull 
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
