@@ -17,33 +17,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # host-* runners are temporary (Sami, 31 Oct: no hosted minutes until
-          # 1 Nov); arm64 builds natively in [simien]'s Docker until a mirab VM
-          # has Docker (mirab#59).
+          # GitHub-hosted: this repo is public and self-hosted runners refuse
+          # public repos (a fork PR must never run on our machines); hosted
+          # runners are free for public repos (addiscorp/infra#34).
           - platform: linux/amd64
-            runner: host-linux-x64
+            runner: ubuntu-24.04
           - platform: linux/arm64
-            runner: host-macos-arm64
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     env:
-      # The host runners share one Docker daemon: tag and container are this job's own.
       IMAGE: pg_zega-ci:${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
       CONTAINER: pg-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
     steps:
       - uses: actions/checkout@v4
-      # [simien]'s Colima is off by default (its RAM runs a local model,
-      # addiscorp/infra#34): start it on demand, as addiscorp/mirab's
-      # release.yml does, and remember whether this job started it.
-      - name: Docker (Colima) on a Mac
-        id: colima
-        if: runner.os == 'macOS'
-        run: |
-          if colima status >/dev/null 2>&1; then
-            echo "started=false" >> "$GITHUB_OUTPUT"
-          else
-            colima start --cpu 2 --memory 3 --disk 60
-            echo "started=true" >> "$GITHUB_OUTPUT"
-          fi
       - name: Compile and install on Postgres 17
         run: docker build --platform ${{ matrix.platform }} -t "$IMAGE" ./postgres
       - name: It starts with pg_zega loaded on ${{ matrix.platform }}
@@ -62,11 +48,6 @@ jobs:
         run: |
           docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
           docker image rm "$IMAGE" >/dev/null 2>&1 || true
-      # Give [simien]'s RAM back. Only a Colima this job started: one that was
-      # already running may be serving another job (mirab's release builds).
-      - name: Stop Colima
-        if: always() && steps.colima.outputs.started == 'true'
-        run: colima stop
 
   # Both modes end to end on amd64, against the published Zega release named
   # in zega-version (vX.Y.Z, or vX.Y.Z-canary-<sha> to test an unreleased
@@ -75,9 +56,8 @@ jobs:
   # which must leave the same graph.
   sync:
     name: Sync tests (precommit and journal)
-    runs-on: host-linux-x64 # temporary, as above
+    runs-on: ubuntu-24.04 # GitHub-hosted, as above
     env:
-      # The host runners share one Docker daemon: this job's compose project is its own.
       COMPOSE_PROJECT_NAME: pg-zega-sync-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
