@@ -2,9 +2,13 @@ name: publish
 
 # addiscorp/pg_zega:17, :0.3 and :latest for linux/amd64 and linux/arm64
 # (Apple Silicon Macs run arm64 images; Intel Macs and most Linux run amd64).
-# Each architecture builds natively and is pushed by digest; merge tags both
+# Each architecture builds on its own and is pushed by digest; merge tags both
 # digests together and checks the tag lists exactly those two; readback pulls
 # the tag on both architectures and starts it with pg_zega loaded.
+#
+# Runners (addiscorp/infra#34): a release builds on our hardware, in the
+# ci-release runner group that admits this public repo: host-linux-x64 for
+# both architectures, arm64 under QEMU (the hosts have binfmt for aarch64).
 
 on:
   release:
@@ -22,12 +26,10 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-24.04
             arch: amd64
           - platform: linux/arm64
-            runner: ubuntu-24.04-arm
             arch: arm64
-    runs-on: ${{ matrix.runner }}
+    runs-on: host-linux-x64
     environment: release
     steps:
       - uses: actions/checkout@v5
@@ -66,7 +68,7 @@ jobs:
   merge:
     name: tags (both architectures)
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: host-linux-x64
     environment: release
     env:
       DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
@@ -123,29 +125,35 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-24.04
           - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+    runs-on: host-linux-x64
     # DOCKERHUB_USERNAME is a release-environment variable.
     environment: release
     env:
       DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+      # Host runners share one Docker daemon: the container is this job's own.
+      CONTAINER: pg-readback-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
     steps:
-      # Pulled by tag from Docker Hub, as Simien's local stack pulls it.
+      # Pulled by tag from Docker Hub, as Simien's local stack pulls it. Both
+      # legs may share a daemon, so the architecture is checked on the image
+      # this container actually runs, not on the (shared) local tag.
       - name: Pull the tag and start it with pg_zega loaded
         run: |
           set -euo pipefail
           image="$DOCKERHUB_USERNAME/pg_zega:0.3"
-          docker pull "$image"
-          test "$(docker image inspect "$image" --format '{{.Os}}/{{.Architecture}}')" = "${{ matrix.platform }}"
-          docker run -d --name pg-readback -e POSTGRES_PASSWORD=readback -e ZEGA_PASSWORD=readback "$image"
-          for _ in $(seq 1 60); do
-            version="$(docker exec pg-readback psql -U postgres -tAc "SELECT extversion FROM pg_extension WHERE extname = 'pg_zega'" 2>/dev/null || true)"
+          docker run -d --pull always --platform "${{ matrix.platform }}" --name "$CONTAINER" \
+            -e POSTGRES_PASSWORD=readback -e ZEGA_PASSWORD=readback "$image"
+          test "$(docker image inspect "$(docker inspect --format '{{.Image}}' "$CONTAINER")" --format '{{.Os}}/{{.Architecture}}')" = "${{ matrix.platform }}"
+          # Emulated (arm64 on an x64 host) it starts slower.
+          for _ in $(seq 1 150); do
+            version="$(docker exec "$CONTAINER" psql -U postgres -tAc "SELECT extversion FROM pg_extension WHERE extname = 'pg_zega'" 2>/dev/null || true)"
             if [ -n "$version" ]; then
               echo "$image: pg_zega $version loaded on ${{ matrix.platform }}"
               test "$version" = 0.3; exit 0
             fi
             sleep 2
           done
-          docker logs pg-readback; exit 1
+          docker logs "$CONTAINER"; exit 1
+      - name: Remove this job's container
+        if: always()
+        run: docker rm -f "$CONTAINER" >/dev/null 2>&1 || true

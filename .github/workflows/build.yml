@@ -11,21 +11,24 @@ jobs:
   # The Postgres image on both architectures Docker users have: amd64 (Linux,
   # Intel Macs) and arm64 (Apple Silicon, ARM Linux), each built natively and
   # each starting with pg_zega loaded.
+  #
+  # Runners (addiscorp/infra#34): pull requests and branch pushes run on
+  # GitHub-hosted runners, each architecture natively. A push to main builds
+  # on our hardware (the ci-release runner group, which admits this public
+  # repo): both architectures on host-linux-x64, arm64 under QEMU (binfmt).
   postgres-17:
     name: Postgres 17 (${{ matrix.platform }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          # GitHub-hosted: this repo is public and self-hosted runners refuse
-          # public repos (a fork PR must never run on our machines); hosted
-          # runners are free for public repos (addiscorp/infra#34).
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            hosted: ubuntu-24.04
           - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+            hosted: ubuntu-24.04-arm
+    runs-on: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'host-linux-x64' || matrix.hosted }}
     env:
+      # Host runners share one Docker daemon: tag and container are this job's own.
       IMAGE: pg_zega-ci:${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
       CONTAINER: pg-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
     steps:
@@ -37,7 +40,8 @@ jobs:
           set -euo pipefail
           test "$(docker image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}')" = "${{ matrix.platform }}"
           docker run -d --name "$CONTAINER" -e POSTGRES_PASSWORD=ci-password -e ZEGA_PASSWORD=ci-zega "$IMAGE"
-          for _ in $(seq 1 60); do
+          # Emulated (arm64 on an x64 host) it starts slower.
+          for _ in $(seq 1 150); do
             version="$(docker exec "$CONTAINER" psql -U postgres -tAc "SELECT extversion FROM pg_extension WHERE extname = 'pg_zega'" 2>/dev/null || true)"
             if [ -n "$version" ]; then echo "pg_zega $version loaded on ${{ matrix.platform }}"; exit 0; fi
             sleep 2
@@ -56,8 +60,9 @@ jobs:
   # which must leave the same graph.
   sync:
     name: Sync tests (precommit and journal)
-    runs-on: ubuntu-24.04 # GitHub-hosted, as above
+    runs-on: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'host-linux-x64' || 'ubuntu-24.04' }}
     env:
+      # Host runners share one Docker daemon: this job's compose project is its own.
       COMPOSE_PROJECT_NAME: pg-zega-sync-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
